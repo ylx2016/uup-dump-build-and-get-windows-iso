@@ -354,8 +354,7 @@ jobs:
         continue-on-error: true
         run: |
           $ErrorActionPreference = 'Continue'
-          $ver = '1.5.0'
-          $url = "https://github.com/zhangjingwei/kuake_cli/releases/download/v$ver/kuake-$ver-windows-amd64.exe"
+          $url = "https://github.com/zhangjingwei/kuake_cli/releases/download/v1.5.0/kuake-v1.5.0-windows-amd64.exe"
           $dest = "$env:RUNNER_TEMP\\kuake.exe"
           Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
           echo "$env:RUNNER_TEMP" >> $env:GITHUB_PATH
