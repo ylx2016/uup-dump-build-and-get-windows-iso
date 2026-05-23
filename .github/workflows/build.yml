@@ -494,7 +494,7 @@ jobs:
           }
 
           Add-Content $env:GITHUB_STEP_SUMMARY @"
-          | Checksum | $($iso.checksum) |
+          | SHA256 | $($iso.checksum) |
           | UUP dump | [$($iso.title)]($($iso.uupDump.downloadUrl)) |
           "@
 
