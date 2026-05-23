@@ -1,4 +1,5 @@
 name: Build Windows
+
 run-name: >
   ${{ inputs.versions }}
   ${{ fromJSON('{"Pro":"PRO","Home":"HOME","Multi":"MULTI"}')[inputs.edition] }}
@@ -201,21 +202,15 @@ jobs:
           $verCode  = $verMap['${{ inputs.versions }}']
 
           $opts = ''
-          if ('${{ inputs.esd }}' -eq 'true')     { $opts += ' -esd' }
-          if (('${{ inputs.drivers }}' -eq 'true') -and ('${{ inputs.architecture }}' -ne 'arm64')) {
-            $opts += ' -drivers'
-          }
-          if ('${{ inputs.netfx3 }}' -eq 'true')  { $opts += ' -netfx3' }
-          if (-not [string]::IsNullOrWhiteSpace('${{ inputs.revision }}')) {
-            $opts += ' -revision "${{ inputs.revision }}"'
-          }
+          if ('${{ inputs.esd }}' -eq 'true') { $opts += ' -esd' }
+          if (('${{ inputs.drivers }}' -eq 'true') -and ('${{ inputs.architecture }}' -ne 'arm64')) { $opts += ' -drivers' }
+          if ('${{ inputs.netfx3 }}' -eq 'true') { $opts += ' -netfx3' }
+          if (-not [string]::IsNullOrWhiteSpace('${{ inputs.revision }}')) { $opts += ' -revision "${{ inputs.revision }}"' }
           $opts = $opts.Trim()
 
-          echo "lang=$langCode"    >> $env:GITHUB_OUTPUT
-          echo "version=$verCode"  >> $env:GITHUB_OUTPUT
-          if ($opts) {
-            echo "options=$opts"   >> $env:GITHUB_OUTPUT
-          }
+          echo "lang=$langCode" >> $env:GITHUB_OUTPUT
+          echo "version=$verCode" >> $env:GITHUB_OUTPUT
+          if ($opts) { echo "options=$opts" >> $env:GITHUB_OUTPUT }
 
       - name: Build Windows
         id: build_windows
@@ -232,7 +227,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
-          $isoFile = Get-Item "$outputDir/*.ISO" | Select-Object -First 1
+          $isoFile = Get-ChildItem -Path $outputDir -Filter "*.ISO" -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $isoFile) {
             Write-Warning "Gofile: ISO file not found."
             echo "GOFILE_LINK=" >> $env:GITHUB_ENV
@@ -244,7 +239,6 @@ jobs:
             $r = Invoke-RestMethod -Uri $uri -Method Post -Form @{ file = $isoFile } -ErrorAction Stop
             if ($r.status -ne 'ok') { throw "status=$($r.status)" }
             echo "GOFILE_LINK=$($r.data.downloadPage)" >> $env:GITHUB_ENV
-            Write-Host "Gofile uploaded: $($r.data.downloadPage)"
           } catch {
             Write-Warning "Gofile upload failed: $_"
             echo "GOFILE_LINK=" >> $env:GITHUB_ENV
@@ -260,7 +254,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
-          $isoFile = Get-Item "$outputDir/*.ISO" | Select-Object -First 1
+          $isoFile = Get-ChildItem -Path $outputDir -Filter "*.ISO" -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $isoFile) {
             Write-Warning "Pixeldrain: ISO file not found."
             echo "PIXELDRAIN_LINK=" >> $env:GITHUB_ENV
@@ -276,15 +270,9 @@ jobs:
             $base64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:PIXELDRAIN_API_KEY"))
             $headers = @{ Authorization = "Basic $base64" }
             $uri = "https://pixeldrain.com/api/file/$([Uri]::EscapeDataString($isoFile.Name))"
-            $r = Invoke-RestMethod -Uri $uri -Method Put `
-                  -Headers $headers `
-                  -InFile $isoFile.FullName `
-                  -ContentType 'application/octet-stream' `
-                  -ErrorAction Stop
+            $r = Invoke-RestMethod -Uri $uri -Method Put -Headers $headers -InFile $isoFile.FullName -ContentType 'application/octet-stream' -ErrorAction Stop
             if (-not $r.id) { throw "no id in response: $($r | ConvertTo-Json -Compress)" }
-            $url = "https://pixeldrain.com/u/$($r.id)"
-            echo "PIXELDRAIN_LINK=$url" >> $env:GITHUB_ENV
-            Write-Host "Pixeldrain uploaded: $url"
+            echo "PIXELDRAIN_LINK=https://pixeldrain.com/u/$($r.id)" >> $env:GITHUB_ENV
           } catch {
             Write-Warning "Pixeldrain upload failed: $_"
             echo "PIXELDRAIN_LINK=" >> $env:GITHUB_ENV
@@ -302,7 +290,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
-          $isoFile = Get-Item "$outputDir/*.ISO" | Select-Object -First 1
+          $isoFile = Get-ChildItem -Path $outputDir -Filter "*.ISO" -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $isoFile) {
             Write-Warning "Buzzheavier: ISO file not found."
             echo "BUZZHEAVIER_LINK=" >> $env:GITHUB_ENV
@@ -322,27 +310,11 @@ jobs:
           try {
             $uri = "https://w.buzzheavier.com/$($env:BUZZHEAVIER_FOLDER_ID)/$([Uri]::EscapeDataString($isoFile.Name))?locationId=$($env:BUZZHEAVIER_LOCATION_ID)"
             $headers = @{ Authorization = "Bearer $env:BUZZHEAVIER_API_KEY" }
-
-            $r = Invoke-RestMethod -Uri $uri -Method Put `
-                  -Headers $headers `
-                  -InFile $isoFile.FullName `
-                  -ContentType 'application/octet-stream' `
-                  -ErrorAction Stop
-
+            $r = Invoke-RestMethod -Uri $uri -Method Put -Headers $headers -InFile $isoFile.FullName -ContentType 'application/octet-stream' -ErrorAction Stop
             $fileId = $null
-            if ($r.id) {
-              $fileId = $r.id
-            } elseif ($r.data -and $r.data.id) {
-              $fileId = $r.data.id
-            }
-
-            if (-not $fileId) {
-              throw "no id in response: $($r | ConvertTo-Json -Compress)"
-            }
-
-            $url = "https://buzzheavier.com/$fileId"
-            echo "BUZZHEAVIER_LINK=$url" >> $env:GITHUB_ENV
-            Write-Host "Buzzheavier uploaded: $url"
+            if ($r.id) { $fileId = $r.id } elseif ($r.data -and $r.data.id) { $fileId = $r.data.id }
+            if (-not $fileId) { throw "no id in response: $($r | ConvertTo-Json -Compress)" }
+            echo "BUZZHEAVIER_LINK=https://buzzheavier.com/$fileId" >> $env:GITHUB_ENV
           } catch {
             Write-Warning "Buzzheavier upload failed: $_"
             echo "BUZZHEAVIER_LINK=" >> $env:GITHUB_ENV
@@ -355,10 +327,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           $url = "https://github.com/zhangjingwei/kuake_cli/releases/download/v1.5.0/kuake-v1.5.0-windows-amd64.exe"
-          $dest = "$env:RUNNER_TEMP\\kuake.exe"
-          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          $dest = "$env:RUNNER_TEMP\kuake.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dest
+          $bytes = [System.IO.File]::ReadAllBytes($dest)
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "Downloaded file is not a valid Windows executable."
+          }
           echo "$env:RUNNER_TEMP" >> $env:GITHUB_PATH
-          Write-Host "Quark CLI downloaded to $dest"
 
       - name: Upload to Quark
         id: upload_quark
@@ -373,7 +348,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
-          $isoFile = Get-Item "$outputDir/*.ISO" | Select-Object -First 1
+          $isoFile = Get-ChildItem -Path $outputDir -Filter "*.ISO" -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $isoFile) {
             Write-Warning "Quark: ISO file not found."
             echo "QUARK_LINK=" >> $env:GITHUB_ENV
@@ -388,36 +363,27 @@ jobs:
           }
 
           try {
-            $kuake = "$env:RUNNER_TEMP\\kuake.exe"
-            if (-not (Test-Path $kuake)) {
-              throw "kuake.exe not found"
-            }
-
+            $kuake = "$env:RUNNER_TEMP\kuake.exe"
+            if (-not (Test-Path $kuake)) { throw "kuake.exe not found" }
             $remotePath = "/uupiso/$($isoFile.Name)"
             $uploadJson = & $kuake upload "$($isoFile.FullName)" "$remotePath" --max_upload_parallel 16
-            if ($LASTEXITCODE -ne 0) {
-              throw "kuake upload failed: $uploadJson"
-            }
+            if ($LASTEXITCODE -ne 0) { throw "kuake upload failed: $uploadJson" }
 
             $shareJson = & $kuake share "$remotePath" 7 "false"
-            if ($LASTEXITCODE -ne 0) {
-              throw "kuake share failed: $shareJson"
-            }
+            if ($LASTEXITCODE -ne 0) { throw "kuake share failed: $shareJson" }
 
             $share = $shareJson | ConvertFrom-Json
             $shareLink = $null
             if ($share.success -and $share.data) {
-              if ($share.data.share_link) { $shareLink = $share.data.share_link }
+              if ($share.data.share_url) { $shareLink = $share.data.share_url }
+              elseif ($share.data.share_link) { $shareLink = $share.data.share_link }
               elseif ($share.data.url) { $shareLink = $share.data.url }
               elseif ($share.data.link) { $shareLink = $share.data.link }
+              elseif ($share.data.pwd_id) { $shareLink = "https://pan.quark.cn/s/$($share.data.pwd_id)" }
             }
 
-            if (-not $shareLink) {
-              throw "Quark share link not found: $shareJson"
-            }
-
+            if (-not $shareLink) { throw "Quark share link not found: $shareJson" }
             echo "QUARK_LINK=$shareLink" >> $env:GITHUB_ENV
-            Write-Host "Quark uploaded: $shareLink"
           } catch {
             Write-Warning "Quark upload failed: $_"
             echo "QUARK_LINK=" >> $env:GITHUB_ENV
@@ -428,9 +394,9 @@ jobs:
         shell: pwsh
         run: |
           $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
-          $jsonPath = Get-ChildItem -Path $outputDir -Filter "*.iso.json" | Select-Object -First 1
+          $jsonPath = Get-ChildItem -Path $outputDir -Filter "*.iso.json" -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $jsonPath) {
-            $jsonPath = Get-ChildItem -Path $outputDir -Filter "*.json" | Select-Object -First 1
+            $jsonPath = Get-ChildItem -Path $outputDir -Filter "*.json" -File -ErrorAction SilentlyContinue | Select-Object -First 1
           }
           if (-not $jsonPath) {
             Write-Error "ISO metadata JSON file not found."
@@ -473,7 +439,7 @@ jobs:
             }
           }
 
-          $isoFile = Get-Item "$outputDir/*.ISO" | Select-Object -First 1
+          $isoFile = Get-ChildItem -Path $outputDir -Filter "*.ISO" -File -ErrorAction SilentlyContinue | Select-Object -First 1
           $isoName = if ($isoFile) { $isoFile.Name } else { $env:ISO_NAME + '.ISO' }
           $isoSize = if ($isoFile) { [math]::Round($isoFile.Length / 1GB, 2).ToString() + ' GB (' + $isoFile.Length + ' bytes)' } else { 'Unknown' }
 
