@@ -88,7 +88,7 @@ on:
           - Ukrainian (Ukraine)
           - Chinese (Simplified, China)
           - Chinese (Traditional, Taiwan)
-        default: English (United States)
+        default: Chinese (Simplified, China)
         required: true
       revision:
         description: "Revision number (optional)"
@@ -118,9 +118,14 @@ on:
         description: "Upload to Pixeldrain"
         type: boolean
         required: true
-        default: true
+        default: false
       upload_buzzheavier:
         description: "Upload to Buzzheavier"
+        type: boolean
+        required: true
+        default: true
+      upload_quark:
+        description: "Upload to Quark"
         type: boolean
         required: true
         default: true
@@ -235,10 +240,8 @@ jobs:
           }
 
           try {
-            # 直接使用官方自动路由的上传端点
             $uri = "https://upload.gofile.io/contents/uploadfile"
             $r = Invoke-RestMethod -Uri $uri -Method Post -Form @{ file = $isoFile } -ErrorAction Stop
-            
             if ($r.status -ne 'ok') { throw "status=$($r.status)" }
             echo "GOFILE_LINK=$($r.data.downloadPage)" >> $env:GITHUB_ENV
             Write-Host "Gofile uploaded: $($r.data.downloadPage)"
@@ -295,6 +298,7 @@ jobs:
         env:
           BUZZHEAVIER_API_KEY: ${{ secrets.BUZZHEAVIER_API_KEY }}
           BUZZHEAVIER_FOLDER_ID: ${{ secrets.BUZZHEAVIER_FOLDER_ID }}
+          BUZZHEAVIER_LOCATION_ID: "12brteedoy0f"
         run: |
           $ErrorActionPreference = 'Continue'
           $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
@@ -309,18 +313,15 @@ jobs:
             echo "BUZZHEAVIER_LINK=" >> $env:GITHUB_ENV
             exit 0
           }
+          if ([string]::IsNullOrWhiteSpace($env:BUZZHEAVIER_FOLDER_ID)) {
+            Write-Warning "Buzzheavier folder id is empty."
+            echo "BUZZHEAVIER_LINK=" >> $env:GITHUB_ENV
+            exit 0
+          }
 
           try {
-            $folderId = if ($env:BUZZHEAVIER_FOLDER_ID) { $env:BUZZHEAVIER_FOLDER_ID } else { '' }
-            if ([string]::IsNullOrWhiteSpace($folderId)) {
-              $uri = "https://w.buzzheavier.com/$([Uri]::EscapeDataString($isoFile.Name))"
-            } else {
-              $uri = "https://w.buzzheavier.com/$folderId/$([Uri]::EscapeDataString($isoFile.Name))"
-            }
-
-            $headers = @{
-              Authorization = "Bearer $env:BUZZHEAVIER_API_KEY"
-            }
+            $uri = "https://w.buzzheavier.com/$($env:BUZZHEAVIER_FOLDER_ID)/$([Uri]::EscapeDataString($isoFile.Name))?locationId=$($env:BUZZHEAVIER_LOCATION_ID)"
+            $headers = @{ Authorization = "Bearer $env:BUZZHEAVIER_API_KEY" }
 
             $r = Invoke-RestMethod -Uri $uri -Method Put `
                   -Headers $headers `
@@ -328,11 +329,18 @@ jobs:
                   -ContentType 'application/octet-stream' `
                   -ErrorAction Stop
 
-            if (-not $r.id) {
+            $fileId = $null
+            if ($r.id) {
+              $fileId = $r.id
+            } elseif ($r.data -and $r.data.id) {
+              $fileId = $r.data.id
+            }
+
+            if (-not $fileId) {
               throw "no id in response: $($r | ConvertTo-Json -Compress)"
             }
 
-            $url = "https://buzzheavier.com/$($r.id)"
+            $url = "https://buzzheavier.com/$fileId"
             echo "BUZZHEAVIER_LINK=$url" >> $env:GITHUB_ENV
             Write-Host "Buzzheavier uploaded: $url"
           } catch {
@@ -340,15 +348,96 @@ jobs:
             echo "BUZZHEAVIER_LINK=" >> $env:GITHUB_ENV
           }
 
+      - name: Setup Quark CLI
+        if: ${{ inputs.upload_quark == true }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ver = '1.4.0'
+          $url = "https://github.com/zhangjingwei/kuake_cli/releases/download/v$ver/kuake-$ver-windows-amd64.exe"
+          $dest = "$env:RUNNER_TEMP\\kuake.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          echo "$env:RUNNER_TEMP" >> $env:GITHUB_PATH
+          Write-Host "Quark CLI downloaded to $dest"
+
+      - name: Upload to Quark
+        id: upload_quark
+        if: ${{ inputs.upload_quark == true }}
+        shell: pwsh
+        continue-on-error: true
+        env:
+          KUAKE_COOKIE: ${{ secrets.KUAKE_COOKIE }}
+          KUAKE_PUS: ${{ secrets.KUAKE_PUS }}
+          KUAKE_PUUS: ${{ secrets.KUAKE_PUUS }}
+          KUAKE_UPLOAD_PARALLEL: "16"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
+          $isoFile = Get-Item "$outputDir/*.ISO" | Select-Object -First 1
+          if (-not $isoFile) {
+            Write-Warning "Quark: ISO file not found."
+            echo "QUARK_LINK=" >> $env:GITHUB_ENV
+            exit 0
+          }
+          $hasCookie = -not [string]::IsNullOrWhiteSpace($env:KUAKE_COOKIE)
+          $hasSplit = (-not [string]::IsNullOrWhiteSpace($env:KUAKE_PUS)) -and (-not [string]::IsNullOrWhiteSpace($env:KUAKE_PUUS))
+          if (-not $hasCookie -and -not $hasSplit) {
+            Write-Warning "Quark credentials are empty."
+            echo "QUARK_LINK=" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          try {
+            $kuake = "$env:RUNNER_TEMP\\kuake.exe"
+            if (-not (Test-Path $kuake)) {
+              throw "kuake.exe not found"
+            }
+
+            $remotePath = "/uupiso/$($isoFile.Name)"
+            $uploadJson = & $kuake upload "$($isoFile.FullName)" "$remotePath" --max_upload_parallel 16
+            if ($LASTEXITCODE -ne 0) {
+              throw "kuake upload failed: $uploadJson"
+            }
+
+            $shareJson = & $kuake share "$remotePath" 7 "false"
+            if ($LASTEXITCODE -ne 0) {
+              throw "kuake share failed: $shareJson"
+            }
+
+            $share = $shareJson | ConvertFrom-Json
+            $shareLink = $null
+            if ($share.success -and $share.data) {
+              if ($share.data.share_link) { $shareLink = $share.data.share_link }
+              elseif ($share.data.url) { $shareLink = $share.data.url }
+              elseif ($share.data.link) { $shareLink = $share.data.link }
+            }
+
+            if (-not $shareLink) {
+              throw "Quark share link not found: $shareJson"
+            }
+
+            echo "QUARK_LINK=$shareLink" >> $env:GITHUB_ENV
+            Write-Host "Quark uploaded: $shareLink"
+          } catch {
+            Write-Warning "Quark upload failed: $_"
+            echo "QUARK_LINK=" >> $env:GITHUB_ENV
+          }
+
       - name: Build summary
         id: build_summary
         shell: pwsh
         run: |
-          $jsonPath = Get-ChildItem -Path $outputDir -Filter "*.json" | Select-Object -First 1
+          $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
+          $jsonPath = Get-ChildItem -Path $outputDir -Filter "*.iso.json" | Select-Object -First 1
           if (-not $jsonPath) {
-              Write-Error "ISO metadata JSON file not found."
-              exit 1
+            $jsonPath = Get-ChildItem -Path $outputDir -Filter "*.json" | Select-Object -First 1
           }
+          if (-not $jsonPath) {
+            Write-Error "ISO metadata JSON file not found."
+            exit 1
+          }
+
           $iso = Get-Content $jsonPath.FullName | ConvertFrom-Json
           $imageNames = $iso.images | ForEach-Object { $_.name }
           if ($imageNames.Count -gt 1) {
@@ -385,9 +474,9 @@ jobs:
             }
           }
 
-          $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
           $isoFile = Get-Item "$outputDir/*.ISO" | Select-Object -First 1
           $isoName = if ($isoFile) { $isoFile.Name } else { $env:ISO_NAME + '.ISO' }
+          $isoSize = if ($isoFile) { [math]::Round($isoFile.Length / 1GB, 2).ToString() + ' GB (' + $isoFile.Length + ' bytes)' } else { 'Unknown' }
 
           Add-Content $env:GITHUB_STEP_SUMMARY @"
           ### FILE INFO:
@@ -398,6 +487,7 @@ jobs:
           | Architecture | ${{ inputs.architecture }} |
           | Language | ${{ inputs.language }} |
           | ISO file | $isoName |
+          | ISO size | $isoSize |
           "@
 
           if ($optsRow) {
@@ -421,6 +511,10 @@ jobs:
           }
           if ($env:BUZZHEAVIER_LINK) {
             $cloudMd += "| Buzzheavier | $($env:BUZZHEAVIER_LINK) |`n"
+            $hasCloud = $true
+          }
+          if ($env:QUARK_LINK) {
+            $cloudMd += "| Quark | $($env:QUARK_LINK) |`n"
             $hasCloud = $true
           }
           if (-not $hasCloud) {
