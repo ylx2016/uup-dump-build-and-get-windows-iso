@@ -99,9 +99,10 @@ function Process-ProgressLine([string]$line) {
 # ------------------------------
 $arch = if ($architecture -eq "x64") { "amd64" } else { "arm64" }
 
-if ($windowsTargetName -match 'beta|dev|wif|canary') {
+if ($windowsTargetName -match 'beta|dev|wif|canary|26h1|25h2|new') {
   $preview = $true
-  $ringLower = @('beta','dev','wif','canary').Where({$windowsTargetName -match $_})[0]
+  $match = @('beta','dev','wif','canary').Where({$windowsTargetName -match $_})
+  if ($match.Count -gt 0) { $ringLower = $match[0] } else { $ringLower = $null }
 }
 
 function Get-EditionName($e) {
@@ -161,6 +162,10 @@ function Get-UupDumpIso($name, $target) {
       $_
     }
   | Where-Object {
+        if ($_.Value.title -match '\.NET Framework') {
+            Write-CleanLine "Skipping. Ignoring .NET Framework update."
+            return $false
+        }
       if (!$preview) {
         $ok = ($target.search -like '*preview*') -or ($_.Value.title -notlike '*preview*')
         if (-not $ok) {
