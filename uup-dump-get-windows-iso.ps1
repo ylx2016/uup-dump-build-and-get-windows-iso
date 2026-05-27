@@ -339,7 +339,7 @@ function Get-WindowsIso($name, $destinationDirectory) {
       $verbuild = $iso.build
     }
   } else {
-    $verbuild = $ringLower.ToUpper()
+    $verbuild = if ($null -ne $ringLower) { $ringLower.ToUpper() } else { $iso.build }
   }
 
   $buildDirectory               = "$destinationDirectory/$name"
