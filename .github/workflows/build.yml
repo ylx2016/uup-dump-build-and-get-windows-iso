@@ -205,7 +205,12 @@ jobs:
           if ('${{ inputs.esd }}' -eq 'true') { $opts += ' -esd' }
           if (('${{ inputs.drivers }}' -eq 'true') -and ('${{ inputs.architecture }}' -ne 'arm64')) { $opts += ' -drivers' }
           if ('${{ inputs.netfx3 }}' -eq 'true') { $opts += ' -netfx3' }
-          if (-not [string]::IsNullOrWhiteSpace('${{ inputs.revision }}')) { $opts += ' -revision "${{ inputs.revision }}"' }
+          if (-not [string]::IsNullOrWhiteSpace('${{ inputs.revision }}')) {
+            if ('${{ inputs.revision }}' -notmatch '^[0-9]+(\.[0-9]+)*$') {
+              throw "Invalid revision '${{ inputs.revision }}': only digits and dots are allowed."
+            }
+            $opts += ' -revision "${{ inputs.revision }}"'
+          }
           $opts = $opts.Trim()
 
           echo "lang=$langCode" >> $env:GITHUB_OUTPUT
@@ -217,7 +222,6 @@ jobs:
         shell: pwsh
         run: |
           pwsh uup-dump-get-windows-iso.ps1 ${{ steps.map.outputs.version }} ${{ inputs.architecture == 'arm64' && 'c:/output' || 'd:/output' }} -architecture ${{ inputs.architecture }} -edition ${{ inputs.edition }} -lang ${{ steps.map.outputs.lang }} ${{ steps.map.outputs.options }}
-          echo "iso_name=$env:ISO_NAME" >> $env:GITHUB_OUTPUT
 
       - name: Upload to Gofile
         id: upload_gofile
@@ -426,12 +430,18 @@ jobs:
               '-drivers' = 'Add additional drivers'
               '-netfx3'  = 'Add .NET Framework 3.5'
             }
-            $items = $opts -split '\s+' |
-              Where-Object { $_ -and $_.Trim() -ne '' } |
-              ForEach-Object {
-                $k = $_.ToLower()
-                if ($descMap.ContainsKey($k)) { $descMap[$k] } else { $_.TrimStart('-') }
-              } | Select-Object -Unique
+            $tokens = @($opts -split '\s+' | Where-Object { $_ -and $_.Trim() -ne '' })
+            $items = @()
+            for ($i = 0; $i -lt $tokens.Count; $i++) {
+              $k = $tokens[$i].ToLower()
+              if ($k -eq '-revision') {
+                $i++
+                if ($i -lt $tokens.Count) { $items += 'Revision: ' + $tokens[$i].Trim('"', "'") }
+              }
+              elseif ($descMap.ContainsKey($k)) { $items += $descMap[$k] }
+              else { $items += $tokens[$i].TrimStart('-') }
+            }
+            $items = @($items | Select-Object -Unique)
 
             if ($items.Count -gt 0) {
               $optsFormatted = ($items | ForEach-Object { "<li>$($_)</li>" }) -join ''
