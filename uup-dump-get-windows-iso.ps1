@@ -99,7 +99,7 @@ function Process-ProgressLine([string]$line) {
 # ------------------------------
 $arch = if ($architecture -eq "x64") { "amd64" } else { "arm64" }
 
-if ($windowsTargetName -match 'beta|dev|wif|canary|26h1|25h2|new') {
+if ($windowsTargetName -match 'beta|dev|wif|canary') {
   $preview = $true
   $match = @('beta','dev','wif','canary').Where({$windowsTargetName -match $_})
   if ($match.Count -gt 0) { $ringLower = $match[0] } else { $ringLower = $null }
@@ -153,6 +153,9 @@ function Invoke-UupDumpApi([string]$name, [hashtable]$body) {
 function Get-UupDumpIso($name, $target) {
   Write-CleanLine "Getting the $name metadata"
   $result = Invoke-UupDumpApi listid @{ search = $target.search }
+  if ($result.response.PSObject.Properties.Name -contains 'error') {
+    throw "uup-dump listid error: $($result.response.error) (search=$($target.search))"
+  }
 
   $result.response.builds.PSObject.Properties
   | ForEach-Object {
@@ -164,6 +167,14 @@ function Get-UupDumpIso($name, $target) {
   | Where-Object {
         if ($_.Value.title -match '\.NET Framework') {
             Write-CleanLine "Skipping. Ignoring .NET Framework update."
+            return $false
+        }
+        if ($_.Value.title -match '^(Cumulative|Preview|Security|Dynamic)\s+Update|^Servicing') {
+            # Update-only entries (LCU/preview/security/servicing packages) pass every other
+            # filter (RETAIL ring, all langs, all editions, "version" in title) but produce
+            # broken ISOs. Real builds are "Windows ... version ..."/"Feature update to..."/
+            # "Insider Preview ..." entries, which this pattern never matches.
+            Write-CleanLine "Skipping. Ignoring update-only entry: $($_.Value.title)"
             return $false
         }
       if (!$preview) {
@@ -283,26 +294,22 @@ function Get-IsoWindowsImages($isoPath) {
 }
 
 # ------------------------------
-# Patch uup_download_windows.cmd with sed - quiet aria2 flags
+# Patch uup_download_windows.cmd - quiet aria2 flags
 # ------------------------------
 function Patch-Aria2-Flags {
   param([string]$CmdPath)
   if (-not (Test-Path $CmdPath)) { return }
 
-  $sed = Get-Command sed -ErrorAction SilentlyContinue
-  if ($sed) {
-    Write-CleanLine "Patching aria2 flags in $CmdPath using sed."
-    # Remove conflicting flags first
-    & $sed.Path -ri 's/\s--console-log-level=\w+\b//g; s/\s--summary-interval=\d+\b//g; s/\s--download-result=\w+\b//g; s/\s--enable-color=\w+\b//g; s/\s-(q|quiet(=\w+)?)\b//g' $CmdPath
-    # Inject quiet set right after "%aria2%"
-    & $sed.Path -ri 's@("%aria2%"\s+)@\1--quiet=true --console-log-level=error --summary-interval=0 --download-result=hide --enable-color=false @g' $CmdPath
-    return
-  }
-
-  # Fallback: PowerShell regex (preserves UTF-16LE)
-  Write-CleanLine "sed not found. Patching aria2 flags in $CmdPath using PowerShell fallback."
+  # Always patch in PowerShell: MSYS2/Git-for-Windows sed (the one on Actions
+  # runners) silently strips CRLF line endings, which breaks goto/label
+  # parsing in this heavily label-based batch file.
+  Write-CleanLine "Patching aria2 flags in $CmdPath."
   $bytes   = [System.IO.File]::ReadAllBytes($CmdPath)
-  $content = [System.Text.Encoding]::Unicode.GetString($bytes)
+  # The uup_download_windows.cmd from uup-dump is plain ASCII/CRLF; only honor
+  # a UTF-16LE BOM if one is actually present.
+  $isUtf16 = $bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE
+  $enc     = if ($isUtf16) { [System.Text.Encoding]::Unicode } else { [System.Text.Encoding]::UTF8 }
+  $content = $enc.GetString($bytes)
 
   $patternsToRemove = @(
     '\s--console-log-level=\w+\b',
@@ -314,11 +321,11 @@ function Patch-Aria2-Flags {
   foreach ($re in $patternsToRemove) {
     $content = [regex]::Replace($content, $re, '', 'IgnoreCase, CultureInvariant')
   }
+  # Inject the quiet flag set right after the "%aria2%" invocation at line start.
   $inject = '--quiet=true --console-log-level=error --summary-interval=0 --download-result=hide --enable-color=false '
-  $content = [regex]::Replace($content, '("%aria2%"\s+)', ('$1' + $inject), 'IgnoreCase, CultureInvariant')
+  $content = [regex]::Replace($content, '(?m)^("%aria2%"\s+)', ('$1' + $inject), 'IgnoreCase, CultureInvariant')
 
-  $newBytes = [System.Text.Encoding]::Unicode.GetBytes($content)
-  [System.IO.File]::WriteAllBytes($CmdPath, $newBytes)
+  [System.IO.File]::WriteAllBytes($CmdPath, $enc.GetBytes($content))
 }
 
 function Get-WindowsIso($name, $destinationDirectory) {
@@ -450,7 +457,13 @@ function Get-WindowsIso($name, $destinationDirectory) {
   Write-CleanLine "Moving the created $sourceIsoPath to $destinationDirectory/$IsoName"
   Move-Item -Force $sourceIsoPath "$destinationDirectory/$IsoName"
 
-  Write-Output "ISO_NAME=$IsoName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+  # GITHUB_ENV/GITHUB_OUTPUT only exist on Actions runners; guards keep local runs working.
+  if ($env:GITHUB_ENV) {
+    Write-Output "ISO_NAME=$IsoName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+  }
+  if ($env:GITHUB_OUTPUT) {
+    Write-Output "iso_name=$IsoName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+  }
   Write-CleanLine 'All Done.'
 }
 
