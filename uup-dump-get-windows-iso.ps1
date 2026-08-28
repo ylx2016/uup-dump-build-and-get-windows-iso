@@ -114,19 +114,21 @@ function Get-EditionName($e) {
   }
 }
 
-$dotSystemRevision = if ([string]::IsNullOrWhiteSpace($revision)) { '' } else { ".$revision" }
-$systemRevision = if ([string]::IsNullOrWhiteSpace($revision)) { '' } else { " $revision" }
-
+# Retail versions are stable build series, so pinning the search to the major
+# build number is correct. Insider channels move to new series every few
+# months, so those targets must use a generic search and rely on the ring
+# filter instead (a pinned search would silently build months-old builds).
+# -revision is handled by a local exact-build filter, not by the search string.
 $TARGETS = @{
-  "windows-10"       = @{ search="windows 10 19045$dotSystemRevision $arch"; edition=(Get-EditionName $edition) }
-  "windows-11old"    = @{ search="windows 11 22631$dotSystemRevision $arch"; edition=(Get-EditionName $edition) }
-  "windows-11"       = @{ search="windows 11 26100$dotSystemRevision $arch"; edition=(Get-EditionName $edition) }
-  "windows-11new"    = @{ search="windows 11 26200$dotSystemRevision $arch"; edition=(Get-EditionName $edition) }
-  "windows-11beta"   = @{ search="windows 11 26120$dotSystemRevision $arch"; edition=(Get-EditionName $edition); ring="Beta" }
-  "windows-11dev"    = @{ search="windows 11 26220$dotSystemRevision $arch"; edition=(Get-EditionName $edition); ring="Wif" }
-  "windows-1126h1"   = @{ search="windows 11 28000$dotSystemRevision $arch"; edition=(Get-EditionName $edition) }
-  "windows-dev"      = @{ search="windows 11 26300$dotSystemRevision $arch"; edition=(Get-EditionName $edition); ring="Dev" }
-  "windows-canary"   = @{ search="windows 11$systemRevision $arch"; edition=(Get-EditionName $edition); ring="Canary" }
+  "windows-10"       = @{ search="windows 10 19045 $arch"; edition=(Get-EditionName $edition) }
+  "windows-11old"    = @{ search="windows 11 22631 $arch"; edition=(Get-EditionName $edition) }
+  "windows-11"       = @{ search="windows 11 26100 $arch"; edition=(Get-EditionName $edition) }
+  "windows-11new"    = @{ search="windows 11 26200 $arch"; edition=(Get-EditionName $edition) }
+  "windows-11beta"   = @{ search="windows 11 $arch"; edition=(Get-EditionName $edition); ring="Beta" }
+  "windows-1126h1"   = @{ search="windows 11 28000 $arch"; edition=(Get-EditionName $edition) }
+  "windows-1126h2"   = @{ search="windows 11 26300 $arch"; edition=(Get-EditionName $edition) }
+  "windows-dev"      = @{ search="windows 11 $arch"; edition=(Get-EditionName $edition); ring="Dev" }
+  "windows-canary"   = @{ search="windows 11 $arch"; edition=(Get-EditionName $edition); ring="Canary" }
 }
 
 function New-QueryString([hashtable]$parameters) {
@@ -158,35 +160,44 @@ function Get-UupDumpIso($name, $target) {
   }
 
   $result.response.builds.PSObject.Properties
-  | ForEach-Object {
-      $id = $_.Value.uuid
-      $uupDumpUrl = 'https://uupdump.net/selectlang.php?' + (New-QueryString @{ id = $id })
-      Write-CleanLine "Processing $name $id ($uupDumpUrl)"
-      $_
-    }
   | Where-Object {
         if ($_.Value.title -match '\.NET Framework') {
             Write-CleanLine "Skipping. Ignoring .NET Framework update."
             return $false
         }
-        if ($_.Value.title -match '^(Cumulative|Preview|Security|Dynamic)\s+Update|^Servicing') {
-            # Update-only entries (LCU/preview/security/servicing packages) pass every other
-            # filter (RETAIL ring, all langs, all editions, "version" in title) but produce
-            # broken ISOs. Real builds are "Windows ... version ..."/"Feature update to..."/
-            # "Insider Preview ..." entries, which this pattern never matches.
+        if ($_.Value.title -match 'Quality\s+Update|^(Cumulative|Preview|Security|Dynamic)\s+Update|^Servicing') {
+            # Update-only entries (LCU/preview/security/servicing/quality packages) pass every
+            # other filter (RETAIL ring, all langs, all editions, "version" in title) but
+            # produce broken ISOs. Real builds are "Windows ... version ..."/"Feature update
+            # to..."/"Insider Preview ..." entries, which this pattern never matches.
             Write-CleanLine "Skipping. Ignoring update-only entry: $($_.Value.title)"
             return $false
         }
-      if (!$preview) {
-        $ok = ($target.search -like '*preview*') -or ($_.Value.title -notlike '*preview*')
-        if (-not $ok) {
-          Write-CleanLine "Skipping.
+        if ($revision) {
+            # -revision pins an exact build: "9278" -> any *.9278 (or 9278.* major build),
+            # "26300.9278" -> exact. Matched locally because the uup-dump search token is
+            # substring-based ("26100.1" would otherwise fuzzy-match "26100.1882").
+            $b = [string]$_.Value.build
+            $revOk = if ($revision -like '*.*') { $b -eq $revision }
+                     else { $b -like "*.$revision" -or $b -like "$revision.*" }
+            if (-not $revOk) { return $false }
+        }
+        if ($ringLower -and $ringLower -ne 'canary' -and -not $revision -and
+            $_.Value.title -match 'rs_prerelease') {
+            # Canary-series entries would flood listlangs/listeditions requests before the
+            # ring check could reject them; their titles always carry the branch marker.
+            return $false
+        }
+        if (!$preview) {
+            $ok = ($target.search -like '*preview*') -or ($_.Value.title -notlike '*preview*')
+            if (-not $ok) {
+                Write-CleanLine "Skipping.
 L1: Expected preview=false.
 L2: Got preview=true."
+            }
+            return $ok
         }
-        return $ok
-      }
-      $true
+        $true
     }
   | ForEach-Object {
       $id = $_.Value.uuid
@@ -217,19 +228,17 @@ L4: Got langs=$($langs -join ',')."
       $res = $true
 
       $expectedRing = if ($ringLower) { $ringLower.ToUpper() } else { 'RETAIL' }
-      if ($ringLower) {
+      # An explicit -revision pins the exact build, so the channel/ring heuristic
+      # must not veto it (e.g. a Dev-series build that has shipped as retail).
+      if ($ringLower -and -not $revision) {
         $actual = ($_.Value.info.ring).ToUpper()
-        if ($ringLower -in @('dev','beta')) {
-          if ($actual -notin @($expectedRing, 'WIF', 'WIS')) {
-            Write-CleanLine "Skipping.
-L5: Expected ring match for $expectedRing, WIS or WIF. Got ring=$actual."
-            $res = $false
-          }
-        } else {
-          if ($actual -ne $expectedRing) {
-            Write-CleanLine "Skipping. Expected ring match for $expectedRing. Got ring=$actual."
-            $res = $false
-          }
+        # WIF = Insider Fast (Dev), WIS = Insider Slow (Beta).
+        $allowedRings = if ($ringLower -eq 'dev') { @('DEV', 'WIF') }
+                        elseif ($ringLower -eq 'beta') { @('BETA', 'WIS') }
+                        else { @($expectedRing) }
+        if ($actual -notin $allowedRings) {
+          Write-CleanLine "Skipping. Expected ring match for $($allowedRings -join '/'). Got ring=$actual."
+          $res = $false
         }
       }
 
@@ -336,17 +345,15 @@ function Get-WindowsIso($name, $destinationDirectory) {
   $hasVirtualMember = $iso.PSObject.Properties.Name -contains 'virtualEdition' -and $iso.virtualEdition
   $effectiveEdition = if ($isoHasEdition) { $iso.edition } else { $TARGETS.$name.edition }
 
-  if (!$preview) {
-    if ($iso.title -match 'version') {
-      $parts = $iso.title -split 'version\s*'
-      if ($parts.Count -lt 2) { throw "Unexpected title format, split resulted in less than 2 parts: $($parts -join '|')" }
-      $verbuild = $parts[1] -split '[\s\(]' | Select-Object -First 1
-    } else {
-      Write-CleanLine "WARN: Unexpected title format: missing 'version'. Using build number fallback."
-      $verbuild = $iso.build
-    }
+  if ($iso.title -match 'version\s+(\S+?)\s*\(') {
+    # e.g. "Windows 11, version 25H2 (26200.9278)" -> "25H2"
+    $verbuild = $matches[1]
+  } elseif ($null -ne $ringLower) {
+    # Insider titles carry no "version xH2" marker; fall back to the channel name.
+    $verbuild = $ringLower.ToUpper()
   } else {
-    $verbuild = if ($null -ne $ringLower) { $ringLower.ToUpper() } else { $iso.build }
+    Write-CleanLine "WARN: Unexpected title format: missing 'version'. Using build number fallback."
+    $verbuild = $iso.build
   }
 
   $buildDirectory               = "$destinationDirectory/$name"
