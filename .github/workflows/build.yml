@@ -1,7 +1,7 @@
 name: Build Windows
 
 run-name: >
-  ${{ inputs.versions }}
+  ${{ fromJSON('{"Windows 10 22H2":"W10","Windows 11 23H2":"W11","Windows 11 24H2":"W11","Windows 11 24H2 BETA":"W11B","Windows 11 25H2":"W11","Windows BETA":"W11B","Windows 11 26H1":"W11","Windows 11 26H2":"W11","Windows DEV":"W11D","Windows CANARY":"W11C"}')[inputs.versions] }}
   ${{ fromJSON('{"Pro":"PRO","Home":"HOME","Multi":"MULTI"}')[inputs.edition] }}
   ${{ fromJSON('{"x64":"X64","arm64":"ARM64"}')[inputs.architecture] }}
   ${{ fromJSON('{
@@ -35,8 +35,9 @@ on:
           - Windows 11 24H2
           - Windows 11 24H2 BETA
           - Windows 11 25H2
-          - Windows 11 25H2 BETA
           - Windows 11 26H1
+          - Windows 11 26H2
+          - Windows BETA
           - Windows DEV
           - Windows CANARY
         default: Windows 11 25H2
@@ -192,8 +193,9 @@ jobs:
             'Windows 11 24H2'      = 'windows-11'
             'Windows 11 24H2 BETA' = 'windows-11beta'
             'Windows 11 25H2'      = 'windows-11new'
-            'Windows 11 25H2 BETA' = 'windows-11dev'
+            'Windows BETA'         = 'windows-11beta'
             'Windows 11 26H1'      = 'windows-1126h1'
+            'Windows 11 26H2'      = 'windows-1126h2'
             'Windows DEV'          = 'windows-dev'
             'Windows CANARY'       = 'windows-canary'
           }
@@ -527,4 +529,4 @@ jobs:
           name: "${{ env.images }} ${{ inputs.architecture }} ${{ env.version }} (${{ env.build }})"
           body_path: summary.md
           draft: false
-          prerelease: ${{ !contains(fromJson('["Windows 10 22H2","Windows 11 23H2","Windows 11 24H2","Windows 11 25H2","Windows 11 26H1"]'), inputs.versions) }}
+          prerelease: ${{ !contains(fromJson('["Windows 10 22H2","Windows 11 23H2","Windows 11 24H2","Windows 11 25H2","Windows 11 26H1","Windows 11 26H2"]'), inputs.versions) }}
