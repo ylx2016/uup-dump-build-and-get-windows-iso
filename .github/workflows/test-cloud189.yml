@@ -170,9 +170,27 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           $c189 = $env:C189_CLI
           $cfg = $env:C189_CFG
+          # GitHub runner 到天翼 API 的线路会偶发 dial i/o timeout, 网络类错误重试 3 次
+          function Invoke-C189 {
+            param([string[]]$CliArgs, [int]$Tries = 3)
+            $out = ''; $code = 0
+            for ($i = 1; $i -le $Tries; $i++) {
+              $out = (& $c189 @CliArgs --config "$cfg" --json 2>&1 | Out-String).Trim()
+              $code = $LASTEXITCODE
+              if ($code -eq 0) { break }
+              # 凭据/权限类错误重试没意义, 只重试网络类
+              if ($out -notmatch 'i/o timeout|connection reset|connection refused|no such host|TLS handshake|EOF|deadline exceeded') { break }
+              if ($i -lt $Tries) {
+                Write-Host "第 $i 次 $($CliArgs -join ' ') 因网络错误失败, 10 秒后重试"
+                Start-Sleep -Seconds 10
+              }
+            }
+            return [pscustomobject]@{ Code = $code; Out = $out }
+          }
           # app 侧(上传走这套): 拿空间信息
-          $dfOut = (& $c189 df --config "$cfg" --json 2>&1 | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0) { throw "df 失败, app 会话不可用: $dfOut" }
+          $dfRes = Invoke-C189 -CliArgs @('df')
+          $dfOut = $dfRes.Out
+          if ($dfRes.Code -ne 0) { throw "df 失败, app 会话不可用: $dfOut" }
           $dfJson = $dfOut -split "`n" | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
           if (-not $dfJson) { throw "df 没返回 JSON: $dfOut" }
           $df = $dfJson | ConvertFrom-Json
@@ -180,8 +198,9 @@ jobs:
           Write-Host "app 会话正常, 可用空间 $availGB GB"
           echo "PRE_AVAIL=$availGB GB" >> $env:GITHUB_ENV
           # web 侧(分享走这套): 只数条数, 不打印分享链接和提取码
-          $lsOut = (& $c189 link ls --config "$cfg" --json 2>&1 | Out-String).Trim()
-          $lsCode = $LASTEXITCODE
+          $lsRes = Invoke-C189 -CliArgs @('link', 'ls')
+          $lsOut = $lsRes.Out
+          $lsCode = $lsRes.Code
           $lsJson = $lsOut -split "`n" | Where-Object { "$_".TrimStart().StartsWith('{') -or "$_".TrimStart().StartsWith('[') } | Select-Object -Last 1
           if ($lsCode -ne 0) {
             $reason = if ($lsJson) { ($lsJson | ConvertFrom-Json).error } else { "无 JSON 错误信息" }
