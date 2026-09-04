@@ -526,7 +526,7 @@ jobs:
             Set-Content -Path $cfg -Value $raw -Encoding utf8 -NoNewline
 
             Write-Host "Cloud189: 上传 $($isoFile.Name) ($([math]::Round($isoFile.Length / 1GB, 2)) GB) -> $remotePath"
-            $upOut = & $c189 up --config "$cfg" --json --input "$($isoFile.FullName)" --path "$remotePath" --policy overwrite --parallel 16 2>&1
+            $upOut = & $c189 up --config "$cfg" --json --input "$($isoFile.FullName)" --path "$remotePath" --policy overwrite --parallel 64 2>&1
             $upCode = $LASTEXITCODE
             $upText = ($upOut | Out-String).Trim()
             if ($upText) { Write-Host $upText }
