@@ -428,8 +428,27 @@ jobs:
           $dest = "$env:RUNNER_TEMP\cloud189.exe"
           try {
             if (-not [string]::IsNullOrWhiteSpace($env:C189_CLI_URL)) {
-              # 有预编译二进制时直接下载, 省去构建
-              Invoke-WebRequest -Uri $env:C189_CLI_URL -OutFile $dest -ErrorAction Stop
+              # 有预编译二进制时直接下载, 省去构建; 若下载到的是 zip(GoReleaser 的
+              # windows 产物就是 zip), 自动解压并取出里面的 cloud189.exe
+              $dl = "$env:RUNNER_TEMP\cloud189-download.bin"
+              Remove-Item $dl -Force -ErrorAction SilentlyContinue
+              Invoke-WebRequest -Uri $env:C189_CLI_URL -OutFile $dl -ErrorAction Stop
+              $sig = [byte[]]::new(2)
+              $fs = [System.IO.File]::OpenRead($dl)
+              try { $null = $fs.Read($sig, 0, 2) } finally { $fs.Dispose() }
+              if ($sig[0] -eq 0x50 -and $sig[1] -eq 0x4B) {
+                $zip = "$env:RUNNER_TEMP\cloud189-download.zip"
+                $unzip = "$env:RUNNER_TEMP\cloud189-unzip"
+                Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                Remove-Item $unzip -Recurse -Force -ErrorAction SilentlyContinue
+                Move-Item $dl $zip -Force
+                Expand-Archive -LiteralPath $zip -DestinationPath $unzip -Force -ErrorAction Stop
+                $exe = Get-ChildItem $unzip -Recurse -Filter "cloud189*.exe" | Select-Object -First 1
+                if (-not $exe) { throw "zip 里找不到 cloud189.exe" }
+                Copy-Item $exe.FullName $dest -Force
+              } else {
+                Move-Item $dl $dest -Force
+              }
             } else {
               $repo = if ([string]::IsNullOrWhiteSpace($env:C189_REPO_OVERRIDE)) { $env:C189_REPO } else { $env:C189_REPO_OVERRIDE }
               $src = "$env:RUNNER_TEMP\cloud189-src"
