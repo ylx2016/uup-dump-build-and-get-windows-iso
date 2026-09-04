@@ -9,7 +9,7 @@ on:
       download_url:
         description: "测试文件下载地址(默认 winos.me 的 Edge stable x64, 约 240 MB)"
         required: false
-        default: "https://www.winos.me/edge/?download=stable-x64"
+        default: "https://qqdl.gtimg.cn/qqfile/QQNTV2/9.9.35/release/8a8b2a64/QQ_9.9.35_260902_x64_01.exe"
       remote_dir:
         description: "云端目录(只删本次上传的文件, 目录本身不会被删)"
         required: false
