@@ -23,9 +23,13 @@ on:
         required: false
         default: "0"
       parallel:
-        description: "上传分片并发数 1-32"
+        description: "上传分片并发数 1-32(分片固定 10 MB, 实际线程数 = min(并发, 分片数))"
         required: false
         default: "16"
+      timeout_minutes:
+        description: "作业超时(分钟), 天翼上传慢时整包 240 MB 可能要 1 小时以上"
+        required: false
+        default: "60"
       make_share:
         description: "创建公开分享链接(消耗当日分享次数)"
         type: boolean
@@ -53,7 +57,7 @@ jobs:
   test:
     # 与 build.yml 的上传步骤同环境: Windows runner + pwsh
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     defaults:
       run:
         shell: pwsh
@@ -275,7 +279,12 @@ jobs:
           $remote = "$dir/$env:LOCAL_NAME"
           # 先落库, 后面的清理步骤即使上传失败也能按这个路径收尾
           echo "C189_REMOTE=$remote" >> $env:GITHUB_ENV
-          Write-Host "上传 $env:LOCAL_NAME -> $remote (并发 $par, 目录不存在会自动创建)"
+          # CLI 分片固定 10 MB, 线程数 = min(--parallel, 分片数); 小文件拿不到高并发
+          $parts = [int][math]::Ceiling([int64]$env:LOCAL_SIZE / 10MB)
+          $threads = [math]::Min($par, $parts)
+          echo "UP_PARTS=$parts" >> $env:GITHUB_ENV
+          echo "UP_THREADS=$threads" >> $env:GITHUB_ENV
+          Write-Host "上传 $env:LOCAL_NAME -> $remote (并发 $par, 预计 $parts 个分片 / $threads 线程, 目录不存在会自动创建)"
           $log = Join-Path $env:RUNNER_TEMP "c189-up.log"
           $sw = [Diagnostics.Stopwatch]::StartNew()
           & $env:C189_CLI up --config "$env:C189_CFG" --json --input "$env:LOCAL_FILE" --path "$remote" --policy overwrite --parallel $par 2>&1 |
@@ -422,7 +431,7 @@ jobs:
           }
           if ($env:C189_REMOTE) { $rows += "| 云端路径 | ``$env:C189_REMOTE`` |" }
           if ($env:C189_FILE_ID) { $rows += "| file_id | ``$env:C189_FILE_ID`` |" }
-          if ($env:UP_SECONDS) { $rows += "| 上传 | $env:UP_SECONDS 秒, 平均 $env:UP_MBPS MB/s (并发 $env:PARALLEL) |" }
+          if ($env:UP_SECONDS) { $rows += "| 上传 | $env:UP_SECONDS 秒, 平均 $env:UP_MBPS MB/s ($env:UP_PARTS 个分片 / $env:UP_THREADS 线程, --parallel $env:PARALLEL) |" }
           if ($env:VERIFY) { $rows += "| 云端校验 | $env:VERIFY |" }
           if ($env:SHARE_NOTE) { $rows += "| 分享 | $env:SHARE_NOTE |" }
           if ($env:CLEANUP) { $rows += "| 清理 | $env:CLEANUP |" }
