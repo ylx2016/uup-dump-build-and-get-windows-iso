@@ -1,0 +1,431 @@
+name: Test Cloud189 upload
+
+# 独立于 build.yml 的天翼云盘链路自测: 下载真实文件 -> 上传 -> 校验 size/MD5 -> 建公开分享 -> 清理。
+# 用来在不跑几小时 ISO 构建的前提下, 验证 secrets.C189_CONFIG、cloud189 CLI 与上传/分享是否可用。
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: "测试文件下载地址(默认 winos.me 的 Edge stable x64, 约 240 MB)"
+        required: false
+        default: "https://www.winos.me/edge/?download=stable-x64"
+      remote_dir:
+        description: "云端目录(只删本次上传的文件, 目录本身不会被删)"
+        required: false
+        default: "/Win11/_c189_test"
+      file_name:
+        description: "云端文件名(留空自动命名)"
+        required: false
+        default: ""
+      truncate_mb:
+        description: "只上传文件前 N MB, 0 = 完整文件(想快速冒烟测试填 16)"
+        required: false
+        default: "0"
+      parallel:
+        description: "上传分片并发数 1-32"
+        required: false
+        default: "16"
+      make_share:
+        description: "创建公开分享链接(消耗当日分享次数)"
+        type: boolean
+        required: false
+        default: true
+      cleanup:
+        description: "结束后取消分享并删除云端测试文件"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+# 同一时刻只跑一个, 免得两次运行抢同一个云端文件名
+concurrency:
+  group: c189-upload-test
+  cancel-in-progress: false
+
+env:
+  C189_REPO: "https://github.com/ylx2016/cloud189.git"
+  C189_REF: "main"
+
+jobs:
+  test:
+    # 与 build.yml 的上传步骤同环境: Windows runner + pwsh
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Setup cloud189 CLI
+        env:
+          C189_CLI_URL: ${{ secrets.C189_CLI_URL }}
+          C189_REPO_OVERRIDE: ${{ secrets.C189_REPO }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 原生命令的退出码由下面自己判, 不要让 pwsh 7.4 抢先抛错
+          $PSNativeCommandUseErrorActionPreference = $false
+          $dest = "$env:RUNNER_TEMP\cloud189.exe"
+          if (-not [string]::IsNullOrWhiteSpace($env:C189_CLI_URL)) {
+            # 有预编译产物就直接下, GoReleaser 的 windows 产物是 zip, 自动解出 exe
+            $dl = "$env:RUNNER_TEMP\cloud189-download.bin"
+            Remove-Item $dl -Force -ErrorAction SilentlyContinue
+            Invoke-WebRequest -Uri $env:C189_CLI_URL -OutFile $dl
+            $sig = [byte[]]::new(2)
+            $fs = [System.IO.File]::OpenRead($dl)
+            try { $null = $fs.Read($sig, 0, 2) } finally { $fs.Dispose() }
+            if ($sig[0] -eq 0x50 -and $sig[1] -eq 0x4B) {
+              $zip = "$env:RUNNER_TEMP\cloud189-download.zip"
+              $unzip = "$env:RUNNER_TEMP\cloud189-unzip"
+              Remove-Item $zip -Force -ErrorAction SilentlyContinue
+              Remove-Item $unzip -Recurse -Force -ErrorAction SilentlyContinue
+              Move-Item $dl $zip -Force
+              Expand-Archive -LiteralPath $zip -DestinationPath $unzip -Force
+              $exe = Get-ChildItem $unzip -Recurse -Filter "cloud189*.exe" | Select-Object -First 1
+              if (-not $exe) { throw "zip 里找不到 cloud189.exe" }
+              Copy-Item $exe.FullName $dest -Force
+            } else {
+              Move-Item $dl $dest -Force
+            }
+            $cliSrc = "预编译 (secrets.C189_CLI_URL)"
+          } else {
+            $repo = if ([string]::IsNullOrWhiteSpace($env:C189_REPO_OVERRIDE)) { $env:C189_REPO } else { $env:C189_REPO_OVERRIDE }
+            $src = "$env:RUNNER_TEMP\cloud189-src"
+            Remove-Item $src -Recurse -Force -ErrorAction SilentlyContinue
+            git clone --quiet --depth 1 --branch "$env:C189_REF" "$repo" "$src"
+            if ($LASTEXITCODE -ne 0) { throw "git clone 失败" }
+            $sha = (git -C "$src" rev-parse --short HEAD | Out-String).Trim()
+            $env:CGO_ENABLED = "0"
+            Push-Location $src
+            try {
+              go build -trimpath -ldflags "-s -w" -o $dest ./cmd/cloud189
+              if ($LASTEXITCODE -ne 0) { throw "go build 失败" }
+            } finally { Pop-Location }
+            $cliSrc = "源码构建 $env:C189_REF@$sha"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes($dest)
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "cloud189.exe 不是有效的 Windows 可执行文件"
+          }
+          # 该版本必须具备本测试用到的能力
+          & $dest link --help > $null 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "该 cloud189 版本没有 link 子命令(分享)" }
+          $upHelp = (& $dest up --help 2>&1) -join "`n"
+          if ($upHelp -notmatch '--input') { throw "该 cloud189 版本的 up 不支持 --input/--path" }
+          Write-Host "cloud189 CLI 就绪: $cliSrc"
+          echo "C189_CLI=$dest" >> $env:GITHUB_ENV
+          echo "C189_CLI_SRC=$cliSrc" >> $env:GITHUB_ENV
+
+      - name: Write credentials
+        env:
+          # 推荐: 本机 config.json 的内容(或其 base64)
+          C189_CONFIG: ${{ secrets.C189_CONFIG }}
+          # 备用: 账号密码
+          C189_USERNAME: ${{ secrets.C189_USERNAME }}
+          C189_PASSWORD: ${{ secrets.C189_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 原生命令的退出码由下面自己判, 不要让 pwsh 7.4 抢先抛错
+          $PSNativeCommandUseErrorActionPreference = $false
+          $cfg = Join-Path $env:RUNNER_TEMP "c189.json"
+          if (-not [string]::IsNullOrWhiteSpace($env:C189_CONFIG)) {
+            $raw = $env:C189_CONFIG.Trim()
+            if (-not $raw.StartsWith('{')) { $raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($raw)) }
+            $credSrc = "secrets.C189_CONFIG"
+          } elseif ((-not [string]::IsNullOrWhiteSpace($env:C189_USERNAME)) -and (-not [string]::IsNullOrWhiteSpace($env:C189_PASSWORD))) {
+            $raw = @{ user = @{ name = $env:C189_USERNAME; password = $env:C189_PASSWORD } } | ConvertTo-Json -Compress
+            $credSrc = "secrets.C189_USERNAME + C189_PASSWORD"
+          } else {
+            throw "没有可用凭据: 请配置 secrets.C189_CONFIG, 或 C189_USERNAME + C189_PASSWORD"
+          }
+          # 只校验结构和键名, 绝不打印任何值
+          $obj = $raw | ConvertFrom-Json
+          $keys = (($obj.PSObject.Properties.Name) | Sort-Object) -join ','
+          $hasUser = [bool]$obj.user -and (-not [string]::IsNullOrWhiteSpace($obj.user.name))
+          Write-Host "凭据来源: $credSrc; 顶层键: $keys"
+          if ($hasUser) {
+            Write-Host "含 user 账号密码 -> runner 换 IP 后可自动重登刷新 web cookie"
+          } else {
+            Write-Warning "配置里没有 user 账号密码: 旧 auth cookie 与 runner IP 不符时无法自愈, 分享环节可能失败"
+          }
+          # pwsh 7 的 -Encoding utf8 不带 BOM, Go 侧才能正常解析
+          Set-Content -Path $cfg -Value $raw -Encoding utf8 -NoNewline
+          echo "C189_CFG=$cfg" >> $env:GITHUB_ENV
+          echo "C189_CRED_SRC=$credSrc" >> $env:GITHUB_ENV
+
+      - name: Preflight
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $c189 = $env:C189_CLI
+          $cfg = $env:C189_CFG
+          # app 侧(上传走这套): 拿空间信息
+          $dfOut = (& $c189 df --config "$cfg" --json 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "df 失败, app 会话不可用: $dfOut" }
+          $dfJson = $dfOut -split "`n" | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
+          if (-not $dfJson) { throw "df 没返回 JSON: $dfOut" }
+          $df = $dfJson | ConvertFrom-Json
+          $availGB = [math]::Round($df.available / 1GB, 2)
+          Write-Host "app 会话正常, 可用空间 $availGB GB"
+          echo "PRE_AVAIL=$availGB GB" >> $env:GITHUB_ENV
+          # web 侧(分享走这套): 只数条数, 不打印分享链接和提取码
+          $lsOut = (& $c189 link ls --config "$cfg" --json 2>&1 | Out-String).Trim()
+          $lsCode = $LASTEXITCODE
+          $lsJson = $lsOut -split "`n" | Where-Object { "$_".TrimStart().StartsWith('{') -or "$_".TrimStart().StartsWith('[') } | Select-Object -Last 1
+          if ($lsCode -ne 0) {
+            $reason = if ($lsJson) { ($lsJson | ConvertFrom-Json).error } else { "无 JSON 错误信息" }
+            # GITHUB_ENV 一行一个值, 错误信息里的换行必须压平
+            $reason = ("$reason" -replace '\r?\n', ' ').Trim()
+            Write-Warning "link ls 失败(web cookie 不可用): $reason"
+            Write-Warning "上传仍会继续, 但建分享的环节大概率失败"
+            echo "PRE_WEB=不可用: $reason" >> $env:GITHUB_ENV
+          } else {
+            # 先赋值再数, 直接 @(管道|ConvertFrom-Json).Count 在两代 PowerShell 上都会数成 1
+            $shares = $lsJson | ConvertFrom-Json
+            $count = if ($null -eq $shares) { 0 } else { @($shares).Count }
+            Write-Host "web 会话正常, 账号现有分享 $count 条"
+            echo "PRE_WEB=正常(现有分享 $count 条)" >> $env:GITHUB_ENV
+          }
+
+      - name: Download test file
+        env:
+          DL_URL: ${{ inputs.download_url }}
+          FILE_NAME: ${{ inputs.file_name }}
+          TRUNCATE_MB: ${{ inputs.truncate_mb }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 原生命令的退出码由下面自己判, 不要让 pwsh 7.4 抢先抛错
+          $PSNativeCommandUseErrorActionPreference = $false
+          $dl = Join-Path $env:RUNNER_TEMP "c189-test-src.bin"
+          Remove-Item $dl -Force -ErrorAction SilentlyContinue
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          # 该地址是 302 跳到微软 CDN, 必须跟随重定向
+          curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 1800 -o "$dl" "$env:DL_URL"
+          if ($LASTEXITCODE -ne 0) { throw "下载失败, curl 退出码 $LASTEXITCODE" }
+          $sw.Stop()
+          $info = Get-Item $dl
+          if ($info.Length -lt 1MB) { throw "下载到的文件只有 $($info.Length) 字节, 大概率是错误页而不是安装包" }
+          $sig = [byte[]]::new(2)
+          $fs = [System.IO.File]::OpenRead($dl)
+          try { $null = $fs.Read($sig, 0, 2) } finally { $fs.Dispose() }
+          $isPe = ($sig[0] -eq 0x4D -and $sig[1] -eq 0x5A)
+          # 换成别的 URL 时不该因为不是 PE 就失败, 只提示
+          if (-not $isPe) { Write-Warning "文件头不是 MZ, 不是 Windows 可执行文件(仅提示)" }
+          $dlSecs = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+          Write-Host "下载完成: $($info.Length) 字节, 耗时 $dlSecs 秒"
+          $mb = 0
+          if (-not [int]::TryParse("$env:TRUNCATE_MB".Trim(), [ref]$mb)) { throw "truncate_mb 不是整数" }
+          $local = $dl
+          $suffix = ""
+          if ($mb -gt 0) {
+            # 冒烟模式: 只取前 N MB, 上传/校验都按截断后的文件算
+            $take = [math]::Min([int64]$mb * 1MB, $info.Length)
+            $cut = Join-Path $env:RUNNER_TEMP "c189-test-cut.bin"
+            Remove-Item $cut -Force -ErrorAction SilentlyContinue
+            $in = [System.IO.File]::OpenRead($dl)
+            $out = [System.IO.File]::Create($cut)
+            try {
+              $buf = [byte[]]::new(1MB)
+              $left = $take
+              while ($left -gt 0) {
+                $n = $in.Read($buf, 0, [math]::Min([int64]$buf.Length, $left))
+                if ($n -le 0) { break }
+                $out.Write($buf, 0, $n)
+                $left -= $n
+              }
+            } finally { $out.Dispose(); $in.Dispose() }
+            $local = $cut
+            $suffix = "-first${mb}mb"
+            Write-Host "已截取前 $mb MB 用于上传"
+          }
+          $name = "$env:FILE_NAME".Trim()
+          if ([string]::IsNullOrWhiteSpace($name)) {
+            $ext = if ($isPe) { ".exe" } else { ".bin" }
+            $name = "c189-test$suffix$ext"
+          }
+          $size = (Get-Item $local).Length
+          $md5 = (Get-FileHash -Path $local -Algorithm MD5).Hash
+          Write-Host "待上传: $name  $size 字节  MD5 $md5"
+          echo "LOCAL_FILE=$local" >> $env:GITHUB_ENV
+          echo "LOCAL_NAME=$name" >> $env:GITHUB_ENV
+          echo "LOCAL_SIZE=$size" >> $env:GITHUB_ENV
+          echo "LOCAL_MD5=$md5" >> $env:GITHUB_ENV
+          echo "DL_SECONDS=$dlSecs" >> $env:GITHUB_ENV
+
+      - name: Upload to Cloud189
+        env:
+          REMOTE_DIR: ${{ inputs.remote_dir }}
+          PARALLEL: ${{ inputs.parallel }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $dir = "$env:REMOTE_DIR".Trim().TrimEnd('/')
+          if (-not $dir.StartsWith('/')) { throw "remote_dir 必须以 / 开头" }
+          if ($dir -eq '') { throw "remote_dir 不能是根目录" }
+          $par = 0
+          if (-not [int]::TryParse("$env:PARALLEL".Trim(), [ref]$par)) { throw "parallel 不是整数" }
+          if ($par -lt 1 -or $par -gt 32) { throw "parallel 需在 1-32 之间" }
+          $remote = "$dir/$env:LOCAL_NAME"
+          # 先落库, 后面的清理步骤即使上传失败也能按这个路径收尾
+          echo "C189_REMOTE=$remote" >> $env:GITHUB_ENV
+          Write-Host "上传 $env:LOCAL_NAME -> $remote (并发 $par, 目录不存在会自动创建)"
+          $log = Join-Path $env:RUNNER_TEMP "c189-up.log"
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & $env:C189_CLI up --config "$env:C189_CFG" --json --input "$env:LOCAL_FILE" --path "$remote" --policy overwrite --parallel $par 2>&1 |
+            Tee-Object -FilePath $log
+          $upCode = $LASTEXITCODE
+          $sw.Stop()
+          $upJson = Get-Content $log -ErrorAction SilentlyContinue | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
+          if ($upCode -ne 0) {
+            $reason = if ($upJson) { ($upJson | ConvertFrom-Json).error } else { "见上方日志" }
+            throw "cloud189 up 失败: $reason"
+          }
+          if (-not $upJson) { throw "cloud189 up 没返回 JSON" }
+          $up = $upJson | ConvertFrom-Json
+          if (-not $up.file_id) { throw "cloud189 up 没返回 file_id" }
+          $secs = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+          $mbps = if ($secs -gt 0) { [math]::Round(([int64]$env:LOCAL_SIZE / 1MB) / $secs, 2) } else { 0 }
+          Write-Host "上传完成: file_id=$($up.file_id) size=$($up.size) 耗时 $secs 秒 平均 $mbps MB/s"
+          echo "C189_FILE_ID=$($up.file_id)" >> $env:GITHUB_ENV
+          echo "UP_SECONDS=$secs" >> $env:GITHUB_ENV
+          echo "UP_MBPS=$mbps" >> $env:GITHUB_ENV
+
+      - name: Verify remote file
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          # 独立再读一次云端信息, 不复用 up 的返回值
+          $out = (& $env:C189_CLI stat --config "$env:C189_CFG" --json "$env:C189_REMOTE" 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "stat 失败: $out" }
+          $line = $out -split "`n" | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
+          if (-not $line) { throw "stat 没查到文件, 云端不存在: $out" }
+          $st = $line | ConvertFrom-Json
+          $localSize = [int64]$env:LOCAL_SIZE
+          if ([int64]$st.size -ne $localSize) { throw "大小不一致: 云端 $($st.size) 字节, 本地 $localSize 字节" }
+          $verify = "size 一致 ($localSize 字节)"
+          if ([string]::IsNullOrWhiteSpace($st.checksum)) {
+            Write-Warning "云端没返回 MD5, 本次只校验了大小"
+            $verify += ", 云端未返回 MD5"
+          } elseif ("$($st.checksum)" -ieq "$env:LOCAL_MD5") {
+            $verify += ", MD5 一致 ($env:LOCAL_MD5)"
+          } else {
+            throw "MD5 不一致: 云端 $($st.checksum), 本地 $env:LOCAL_MD5"
+          }
+          Write-Host "校验通过: $verify"
+          echo "VERIFY=$verify" >> $env:GITHUB_ENV
+
+      - name: Create public share
+        if: ${{ inputs.make_share }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          # 与 build.yml 完全一致的调用方式: 永久公开分享, --reuse 复用同模式已有分享
+          $out = (& $env:C189_CLI link --config "$env:C189_CFG" --json --file-id "$env:C189_FILE_ID" --public --expire 2099 --reuse 2>&1 | Out-String).Trim()
+          $code = $LASTEXITCODE
+          $json = $out -split "`n" | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
+          if ($code -ne 0) {
+            $reason = if ($json) { ($json | ConvertFrom-Json).error } else { $out }
+            if ("$reason" -match '当日分享次数已达上限|ShareCreateOverload') {
+              # 配额问题不算链路故障
+              Write-Warning "当日分享次数已达上限, 本次跳过分享环节"
+              echo "SHARE_NOTE=跳过: 当日分享次数已达上限" >> $env:GITHUB_ENV
+              exit 0
+            }
+            throw "cloud189 link 失败: $reason"
+          }
+          if (-not $json) { throw "cloud189 link 没返回 JSON: $out" }
+          $share = $json | ConvertFrom-Json
+          if (-not $share.url) { throw "cloud189 link 没返回分享链接: $out" }
+          Write-Host "公开分享: $($share.url) (share_id=$($share.share_id))"
+          echo "C189_SHARE_ID=$($share.share_id)" >> $env:GITHUB_ENV
+          echo "C189_SHARE_URL=$($share.url)" >> $env:GITHUB_ENV
+          echo "SHARE_NOTE=$($share.url)" >> $env:GITHUB_ENV
+
+      - name: Cleanup remote
+        if: ${{ always() && inputs.cleanup }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:C189_CFG)) {
+            Write-Host "凭据未就绪, 无需清理"
+            exit 0
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:C189_SHARE_ID)) {
+            & $env:C189_CLI link rm --config "$env:C189_CFG" "$env:C189_SHARE_ID" 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "取消分享失败, 请手动处理 share_id=$env:C189_SHARE_ID"
+            } else {
+              Write-Host "已取消分享 $env:C189_SHARE_ID"
+            }
+          }
+          # 只删本次上传的那个文件, 绝不动 remote_dir 目录本身
+          if ([string]::IsNullOrWhiteSpace($env:C189_REMOTE)) {
+            echo "CLEANUP=没上传过文件, 无需清理" >> $env:GITHUB_ENV
+            exit 0
+          }
+          $probe = (& $env:C189_CLI stat --config "$env:C189_CFG" --json "$env:C189_REMOTE" 2>&1 | Out-String)
+          if ($probe -notmatch '"file_id"') {
+            echo "CLEANUP=云端无该文件, 无需删除" >> $env:GITHUB_ENV
+            exit 0
+          }
+          & $env:C189_CLI rm --config "$env:C189_CFG" "$env:C189_REMOTE" 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "删除失败, 请手动清理 $env:C189_REMOTE"
+            echo "CLEANUP=删除失败, 需手动清理 $env:C189_REMOTE" >> $env:GITHUB_ENV
+            exit 0
+          }
+          $after = (& $env:C189_CLI stat --config "$env:C189_CFG" --json "$env:C189_REMOTE" 2>&1 | Out-String)
+          if ($after -match '"file_id"') {
+            Write-Warning "删除后仍能 stat 到文件"
+            echo "CLEANUP=删除后仍存在" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "已删除 $env:C189_REMOTE"
+            echo "CLEANUP=已删除云端测试文件" >> $env:GITHUB_ENV
+          }
+
+      - name: Remove credentials
+        if: always()
+        run: |
+          # 会话和账号密码都在这个文件里, 无论成败都删掉
+          if (-not [string]::IsNullOrWhiteSpace($env:C189_CFG)) {
+            Remove-Item $env:C189_CFG -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "临时凭据文件已删除"
+
+      - name: Summary
+        if: always()
+        env:
+          DL_URL: ${{ inputs.download_url }}
+          TRUNCATE_MB: ${{ inputs.truncate_mb }}
+          PARALLEL: ${{ inputs.parallel }}
+        run: |
+          $rows = @()
+          $rows += "| 项目 | 结果 |"
+          $rows += "| --- | --- |"
+          $rows += "| 下载地址 | ``$env:DL_URL`` |"
+          $rows += "| CLI 来源 | $env:C189_CLI_SRC |"
+          $rows += "| 凭据来源 | $env:C189_CRED_SRC |"
+          $rows += "| 预检 app 侧 | 可用空间 $env:PRE_AVAIL |"
+          $rows += "| 预检 web 侧 | $env:PRE_WEB |"
+          if ($env:LOCAL_SIZE) {
+            $mbSize = [math]::Round([int64]$env:LOCAL_SIZE / 1MB, 2)
+            $rows += "| 测试文件 | ``$env:LOCAL_NAME`` $mbSize MB (截断参数 $env:TRUNCATE_MB MB) |"
+            $rows += "| 本地 MD5 | ``$env:LOCAL_MD5`` |"
+            $rows += "| 下载耗时 | $env:DL_SECONDS 秒 |"
+          }
+          if ($env:C189_REMOTE) { $rows += "| 云端路径 | ``$env:C189_REMOTE`` |" }
+          if ($env:C189_FILE_ID) { $rows += "| file_id | ``$env:C189_FILE_ID`` |" }
+          if ($env:UP_SECONDS) { $rows += "| 上传 | $env:UP_SECONDS 秒, 平均 $env:UP_MBPS MB/s (并发 $env:PARALLEL) |" }
+          if ($env:VERIFY) { $rows += "| 云端校验 | $env:VERIFY |" }
+          if ($env:SHARE_NOTE) { $rows += "| 分享 | $env:SHARE_NOTE |" }
+          if ($env:CLEANUP) { $rows += "| 清理 | $env:CLEANUP |" }
+          $body = "## 天翼云盘上传测试`n`n" + ($rows -join "`n") + "`n"
+          Set-Content -Path $env:GITHUB_STEP_SUMMARY -Value $body -Encoding utf8
+          Write-Host $body
