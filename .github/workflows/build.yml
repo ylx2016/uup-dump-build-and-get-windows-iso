@@ -144,7 +144,9 @@ env:
   # cloud189 CLI 的源码位置, 必须包含 link 子命令与 up --json (本仓库定制版)
   # 私有仓库可用 secrets.C189_REPO 覆盖, 形如 https://<token>@github.com/<owner>/cloud189.git
   C189_REPO: "https://github.com/ylx2016/cloud189.git"
-  C189_REF: "main"
+  # 钉到 tag 保证可复现; 想跟随最新改动就改回 "main"
+  # v0.8.0: 189 接口网络错误重试 10 次(间隔 2 秒), 上传并发上限 64
+  C189_REF: "v0.8.0"
   # ISO 在天翼云盘上的目录
   C189_DIR: "/Win11"
 
@@ -515,6 +517,32 @@ jobs:
           $remotePath = "$env:C189_DIR/$($isoFile.Name)"
           $link = ""
           $uploaded = $false
+
+          # 天翼各接口从 runner 访问会偶发 dial i/o timeout。CLI 内部已经对网络类错误
+          # 重试 10 次(固定间隔 2 秒), 分片也是每片最多 10 次; 这里再包一层同样的策略,
+          # 覆盖 CLI 整体退出之后才暴露出来的抖动。只重试网络类错误 ——
+          # 凭据失效、路径非法、当日分享次数超限这些重试多少次都一样。
+          # 注意 up 重试是整包重传(重新 initMultiUpload), 所以内层重试兜不住时才会走到。
+          $c189Tries = 10
+          $c189Delay = 2
+          function Invoke-C189 {
+            param([string[]]$CliArgs)
+            $lines = @()
+            $code = 0
+            for ($i = 1; $i -le $c189Tries; $i++) {
+              $lines = @(& $c189 @CliArgs 2>&1 | ForEach-Object { "$_" })
+              $code = $LASTEXITCODE
+              if ($code -eq 0) { break }
+              $text = $lines -join "`n"
+              if ($text -notmatch 'i/o timeout|connection reset|connection refused|no such host|TLS handshake|unexpected EOF|EOF|deadline exceeded|network is unreachable|temporarily unavailable') { break }
+              if ($i -lt $c189Tries) {
+                Write-Host "Cloud189: 第 $i 次 $($CliArgs[0]) 因网络错误失败, $c189Delay 秒后重试(共 $c189Tries 次)"
+                Start-Sleep -Seconds $c189Delay
+              }
+            }
+            return [pscustomobject]@{ Code = $code; Out = $lines }
+          }
+
           try {
             if ($hasConfig) {
               $raw = $env:C189_CONFIG.Trim()
@@ -526,8 +554,9 @@ jobs:
             Set-Content -Path $cfg -Value $raw -Encoding utf8 -NoNewline
 
             Write-Host "Cloud189: 上传 $($isoFile.Name) ($([math]::Round($isoFile.Length / 1GB, 2)) GB) -> $remotePath"
-            $upOut = & $c189 up --config "$cfg" --json --input "$($isoFile.FullName)" --path "$remotePath" --policy overwrite --parallel 64 2>&1
-            $upCode = $LASTEXITCODE
+            $upRes = Invoke-C189 -CliArgs @('up', '--config', $cfg, '--json', '--input', $isoFile.FullName, '--path', $remotePath, '--policy', 'overwrite', '--parallel', '64')
+            $upOut = $upRes.Out
+            $upCode = $upRes.Code
             $upText = ($upOut | Out-String).Trim()
             if ($upText) { Write-Host $upText }
             $upJson = $upOut | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
@@ -541,8 +570,9 @@ jobs:
             $uploaded = $true
 
             # 永久公开分享, --reuse 复用已有分享, 重跑不消耗当日分享次数
-            $shOut = & $c189 link --config "$cfg" --json --file-id "$($up.file_id)" --public --expire 2099 --reuse 2>&1
-            $shCode = $LASTEXITCODE
+            $shRes = Invoke-C189 -CliArgs @('link', '--config', $cfg, '--json', '--file-id', "$($up.file_id)", '--public', '--expire', '2099', '--reuse')
+            $shOut = $shRes.Out
+            $shCode = $shRes.Code
             $shText = ($shOut | Out-String).Trim()
             if ($shText) { Write-Host $shText }
             $shJson = $shOut | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
