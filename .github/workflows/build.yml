@@ -131,9 +131,22 @@ on:
         type: boolean
         required: true
         default: true
+      upload_c189:
+        description: "Upload to Cloud189 (天翼云盘)"
+        type: boolean
+        required: true
+        default: true
 
 permissions:
   contents: write
+
+env:
+  # cloud189 CLI 的源码位置, 必须包含 link 子命令与 up --json (本仓库定制版)
+  # 私有仓库可用 secrets.C189_REPO 覆盖, 形如 https://<token>@github.com/<owner>/cloud189.git
+  C189_REPO: "https://github.com/ylx2016/cloud189.git"
+  C189_REF: "main"
+  # ISO 在天翼云盘上的目录
+  C189_DIR: "/Win11"
 
 jobs:
   build:
@@ -395,6 +408,148 @@ jobs:
             echo "QUARK_LINK=" >> $env:GITHUB_ENV
           }
 
+      - name: Setup Go
+        if: ${{ inputs.upload_c189 == true }}
+        uses: actions/setup-go@v5
+        continue-on-error: true
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Setup cloud189 CLI
+        if: ${{ inputs.upload_c189 == true }}
+        shell: pwsh
+        continue-on-error: true
+        env:
+          C189_CLI_URL: ${{ secrets.C189_CLI_URL }}
+          C189_REPO_OVERRIDE: ${{ secrets.C189_REPO }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $dest = "$env:RUNNER_TEMP\cloud189.exe"
+          try {
+            if (-not [string]::IsNullOrWhiteSpace($env:C189_CLI_URL)) {
+              # 有预编译二进制时直接下载, 省去构建
+              Invoke-WebRequest -Uri $env:C189_CLI_URL -OutFile $dest -ErrorAction Stop
+            } else {
+              $repo = if ([string]::IsNullOrWhiteSpace($env:C189_REPO_OVERRIDE)) { $env:C189_REPO } else { $env:C189_REPO_OVERRIDE }
+              $src = "$env:RUNNER_TEMP\cloud189-src"
+              Remove-Item $src -Recurse -Force -ErrorAction SilentlyContinue
+              git clone --quiet --depth 1 --branch "$env:C189_REF" "$repo" "$src"
+              if ($LASTEXITCODE -ne 0) { throw "git clone 失败" }
+              $env:CGO_ENABLED = "0"
+              Push-Location $src
+              try {
+                go build -trimpath -ldflags "-s -w" -o $dest ./cmd/cloud189
+                if ($LASTEXITCODE -ne 0) { throw "go build 失败" }
+              } finally { Pop-Location }
+            }
+            $bytes = [System.IO.File]::ReadAllBytes($dest)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+              throw "cloud189.exe 不是有效的 Windows 可执行文件"
+            }
+            # 校验该版本是否具备本工作流需要的能力
+            & $dest link --help > $null 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "该 cloud189 版本没有 link 子命令(分享), 请把 C189_REPO 指向包含 link 的版本" }
+            $upHelp = (& $dest up --help 2>&1) -join "`n"
+            if ($upHelp -notmatch '--input') { throw "该 cloud189 版本的 up 不支持 --input/--path" }
+            echo "C189_CLI=$dest" >> $env:GITHUB_ENV
+            echo "C189_READY=1" >> $env:GITHUB_ENV
+          } catch {
+            Write-Warning "Cloud189 CLI 准备失败: $_"
+            echo "C189_READY=0" >> $env:GITHUB_ENV
+          }
+
+      - name: Upload to Cloud189
+        id: upload_c189
+        if: ${{ inputs.upload_c189 == true }}
+        shell: pwsh
+        continue-on-error: true
+        env:
+          # 推荐: 本机执行 cloud189 login/qrlogin 后, 把 config.json 内容(或其 base64)存为该 secret
+          C189_CONFIG: ${{ secrets.C189_CONFIG }}
+          # 备用: 账号密码。新 IP 首次登录可能触发验证码, 此时请改用 C189_CONFIG
+          C189_USERNAME: ${{ secrets.C189_USERNAME }}
+          C189_PASSWORD: ${{ secrets.C189_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $outputDir = "${{ inputs.architecture == 'arm64' && 'C:/output' || 'D:/output' }}"
+          $isoFile = Get-ChildItem -Path $outputDir -Filter "*.ISO" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $isoFile) {
+            Write-Warning "Cloud189: ISO file not found."
+            echo "C189_LINK=" >> $env:GITHUB_ENV
+            exit 0
+          }
+          if ($env:C189_READY -ne '1') {
+            Write-Warning "Cloud189: CLI 不可用, 跳过上传。"
+            echo "C189_LINK=" >> $env:GITHUB_ENV
+            exit 0
+          }
+          $hasConfig = -not [string]::IsNullOrWhiteSpace($env:C189_CONFIG)
+          $hasPwd = (-not [string]::IsNullOrWhiteSpace($env:C189_USERNAME)) -and (-not [string]::IsNullOrWhiteSpace($env:C189_PASSWORD))
+          if (-not $hasConfig -and -not $hasPwd) {
+            Write-Warning "Cloud189 credentials are empty."
+            echo "C189_LINK=" >> $env:GITHUB_ENV
+            exit 0
+          }
+          $cfg = Join-Path $env:RUNNER_TEMP "c189.json"
+          $c189 = $env:C189_CLI
+          $remotePath = "$env:C189_DIR/$($isoFile.Name)"
+          $link = ""
+          $uploaded = $false
+          try {
+            if ($hasConfig) {
+              $raw = $env:C189_CONFIG.Trim()
+              if (-not $raw.StartsWith('{')) { $raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($raw)) }
+            } else {
+              $raw = @{ user = @{ name = $env:C189_USERNAME; password = $env:C189_PASSWORD } } | ConvertTo-Json -Compress
+            }
+            # 凭据只落到临时文件, 不打印, 步骤结束即删除
+            Set-Content -Path $cfg -Value $raw -Encoding utf8 -NoNewline
+
+            Write-Host "Cloud189: 上传 $($isoFile.Name) ($([math]::Round($isoFile.Length / 1GB, 2)) GB) -> $remotePath"
+            $upOut = & $c189 up --config "$cfg" --json --input "$($isoFile.FullName)" --path "$remotePath" --policy overwrite --parallel 16 2>&1
+            $upCode = $LASTEXITCODE
+            $upText = ($upOut | Out-String).Trim()
+            if ($upText) { Write-Host $upText }
+            $upJson = $upOut | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
+            if ($upCode -ne 0) {
+              $reason = if ($upJson) { ($upJson | ConvertFrom-Json).error } else { $upText }
+              throw "cloud189 up 失败: $reason"
+            }
+            if (-not $upJson) { throw "cloud189 up 未返回 JSON: $upText" }
+            $up = $upJson | ConvertFrom-Json
+            if (-not $up.file_id) { throw "cloud189 up 未返回 file_id: $upText" }
+            $uploaded = $true
+
+            # 永久公开分享, --reuse 复用已有分享, 重跑不消耗当日分享次数
+            $shOut = & $c189 link --config "$cfg" --json --file-id "$($up.file_id)" --public --expire 2099 --reuse 2>&1
+            $shCode = $LASTEXITCODE
+            $shText = ($shOut | Out-String).Trim()
+            if ($shText) { Write-Host $shText }
+            $shJson = $shOut | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1
+            if ($shCode -ne 0) {
+              $reason = if ($shJson) { ($shJson | ConvertFrom-Json).error } else { $shText }
+              if ("$reason" -match '当日分享次数已达上限|ShareCreateOverload') {
+                Write-Warning "Cloud189: 当日分享次数已达上限, 文件已上传到 $remotePath, 本次不生成分享链接。"
+              } else {
+                throw "cloud189 link 失败: $reason"
+              }
+            } else {
+              if (-not $shJson) { throw "cloud189 link 未返回 JSON: $shText" }
+              $share = $shJson | ConvertFrom-Json
+              if (-not $share.url) { throw "cloud189 link 未返回分享链接: $shText" }
+              $link = $share.url
+              if ($share.access_code) { $link = "$($share.url) (提取码: $($share.access_code))" }
+            }
+          } catch {
+            Write-Warning "Cloud189 upload failed: $_"
+          } finally {
+            # 会话与账号信息都在该文件里, 无论成败都删掉
+            Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+          }
+          echo "C189_LINK=$link" >> $env:GITHUB_ENV
+          if ($uploaded) { echo "C189_PATH=$remotePath" >> $env:GITHUB_ENV }
+
       - name: Build summary
         id: build_summary
         shell: pwsh
@@ -492,6 +647,13 @@ jobs:
           }
           if ($env:QUARK_LINK) {
             $cloudMd += "| Quark | $($env:QUARK_LINK) |`n"
+            $hasCloud = $true
+          }
+          if ($env:C189_LINK) {
+            $cloudMd += "| 天翼云盘 | $($env:C189_LINK) |`n"
+            $hasCloud = $true
+          } elseif ($env:C189_PATH) {
+            $cloudMd += "| 天翼云盘 | 已上传到 ``$($env:C189_PATH)``, 未生成分享链接 |`n"
             $hasCloud = $true
           }
           if (-not $hasCloud) {
