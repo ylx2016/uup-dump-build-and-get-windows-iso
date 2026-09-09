@@ -105,7 +105,7 @@ on:
         description: "Add .NET Framework 3.5"
         type: boolean
         required: true
-        default: false
+        default: true
       drivers:
         description: "Add additional drivers (only for x64)"
         type: boolean
