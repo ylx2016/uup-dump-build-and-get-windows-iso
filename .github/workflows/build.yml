@@ -141,12 +141,7 @@ permissions:
   contents: write
 
 env:
-  # cloud189 CLI 的源码位置, 必须包含 link 子命令与 up --json (本仓库定制版)
-  # 私有仓库可用 secrets.C189_REPO 覆盖, 形如 https://<token>@github.com/<owner>/cloud189.git
-  C189_REPO: "https://github.com/ylx2016/cloud189.git"
-  # 钉到 tag 保证可复现; 想跟随最新改动就改回 "main"
-  # v0.8.0: 189 接口网络错误重试 10 次(间隔 2 秒), 上传并发上限 64
-  C189_REF: "v0.8.0"
+  # cloud189 CLI 从上游 GitHub Releases 的最新正式版下载
   # ISO 在天翼云盘上的目录
   C189_DIR: "/Win11"
 
@@ -410,69 +405,41 @@ jobs:
             echo "QUARK_LINK=" >> $env:GITHUB_ENV
           }
 
-      - name: Setup Go
-        if: ${{ inputs.upload_c189 == true }}
-        uses: actions/setup-go@v5
-        continue-on-error: true
-        with:
-          go-version: "1.23"
-          cache: false
-
       - name: Setup cloud189 CLI
         if: ${{ inputs.upload_c189 == true }}
         shell: pwsh
         continue-on-error: true
-        env:
-          C189_CLI_URL: ${{ secrets.C189_CLI_URL }}
-          C189_REPO_OVERRIDE: ${{ secrets.C189_REPO }}
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
           $dest = "$env:RUNNER_TEMP\cloud189.exe"
           try {
-            if (-not [string]::IsNullOrWhiteSpace($env:C189_CLI_URL)) {
-              # 有预编译二进制时直接下载, 省去构建; 若下载到的是 zip(GoReleaser 的
-              # windows 产物就是 zip), 自动解压并取出里面的 cloud189.exe
-              $dl = "$env:RUNNER_TEMP\cloud189-download.bin"
-              Remove-Item $dl -Force -ErrorAction SilentlyContinue
-              Invoke-WebRequest -Uri $env:C189_CLI_URL -OutFile $dl -ErrorAction Stop
-              $sig = [byte[]]::new(2)
-              $fs = [System.IO.File]::OpenRead($dl)
-              try { $null = $fs.Read($sig, 0, 2) } finally { $fs.Dispose() }
-              if ($sig[0] -eq 0x50 -and $sig[1] -eq 0x4B) {
-                $zip = "$env:RUNNER_TEMP\cloud189-download.zip"
-                $unzip = "$env:RUNNER_TEMP\cloud189-unzip"
-                Remove-Item $zip -Force -ErrorAction SilentlyContinue
-                Remove-Item $unzip -Recurse -Force -ErrorAction SilentlyContinue
-                Move-Item $dl $zip -Force
-                Expand-Archive -LiteralPath $zip -DestinationPath $unzip -Force -ErrorAction Stop
-                $exe = Get-ChildItem $unzip -Recurse -Filter "cloud189*.exe" | Select-Object -First 1
-                if (-not $exe) { throw "zip 里找不到 cloud189.exe" }
-                Copy-Item $exe.FullName $dest -Force
-              } else {
-                Move-Item $dl $dest -Force
-              }
-            } else {
-              $repo = if ([string]::IsNullOrWhiteSpace($env:C189_REPO_OVERRIDE)) { $env:C189_REPO } else { $env:C189_REPO_OVERRIDE }
-              $src = "$env:RUNNER_TEMP\cloud189-src"
-              Remove-Item $src -Recurse -Force -ErrorAction SilentlyContinue
-              git clone --quiet --depth 1 --branch "$env:C189_REF" "$repo" "$src"
-              if ($LASTEXITCODE -ne 0) { throw "git clone 失败" }
-              $env:CGO_ENABLED = "0"
-              Push-Location $src
-              try {
-                go build -trimpath -ldflags "-s -w" -o $dest ./cmd/cloud189
-                if ($LASTEXITCODE -ne 0) { throw "go build 失败" }
-              } finally { Pop-Location }
-            }
+            # latest API 只返回最新正式 release；按 runner 架构选择官方 GoReleaser ZIP。
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ylx2016/cloud189/releases/latest" -Headers @{ Accept = "application/vnd.github+json" }
+            $assetArch = if ('${{ inputs.architecture }}' -eq 'arm64') { 'arm64' } else { 'amd64' }
+            $pattern = "^cloud189_.*_windows_$assetArch\.zip$"
+            $asset = @($release.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1)
+            if (-not $asset) { throw "Release $($release.tag_name) 中找不到匹配 $pattern 的 Windows 资产" }
+
+            $zip = "$env:RUNNER_TEMP\$($asset.name)"
+            $unzip = "$env:RUNNER_TEMP\cloud189-unzip"
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            Remove-Item $unzip -Recurse -Force -ErrorAction SilentlyContinue
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
+            Expand-Archive -LiteralPath $zip -DestinationPath $unzip -Force
+            $exe = Get-ChildItem -Path $unzip -Recurse -Filter 'cloud189.exe' -File | Select-Object -First 1
+            if (-not $exe) { throw "Release $($release.tag_name) 的 ZIP 中找不到 cloud189.exe" }
+            Copy-Item $exe.FullName $dest -Force
+
             $bytes = [System.IO.File]::ReadAllBytes($dest)
             if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
               throw "cloud189.exe 不是有效的 Windows 可执行文件"
             }
-            # 校验该版本是否具备本工作流需要的能力
+            # 校验最新 release 仍具备本工作流需要的能力。
             & $dest link --help > $null 2>&1
-            if ($LASTEXITCODE -ne 0) { throw "该 cloud189 版本没有 link 子命令(分享), 请把 C189_REPO 指向包含 link 的版本" }
+            if ($LASTEXITCODE -ne 0) { throw "Release $($release.tag_name) 没有 link 子命令(分享)" }
             $upHelp = (& $dest up --help 2>&1) -join "`n"
-            if ($upHelp -notmatch '--input') { throw "该 cloud189 版本的 up 不支持 --input/--path" }
+            if ($upHelp -notmatch '--input') { throw "Release $($release.tag_name) 的 up 不支持 --input/--path" }
+            Write-Host "Cloud189: 已下载 $($release.tag_name) 的 $($asset.name)"
             echo "C189_CLI=$dest" >> $env:GITHUB_ENV
             echo "C189_READY=1" >> $env:GITHUB_ENV
           } catch {
