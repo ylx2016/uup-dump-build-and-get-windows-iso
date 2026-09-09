@@ -125,7 +125,7 @@ on:
         description: "Upload to Buzzheavier"
         type: boolean
         required: true
-        default: true
+        default: false
       upload_quark:
         description: "Upload to Quark"
         type: boolean
