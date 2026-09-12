@@ -227,7 +227,7 @@ jobs:
             if ($revision -notmatch '^[0-9]+(\.[0-9]+)*$') {
               throw "Invalid revision '$revision': only digits and dots are allowed."
             }
-            $opts += ' -revision "$revision"'
+            $opts += " -revision `"$revision`""
           }
           if ($verCode -eq 'windows-custom') { $opts += ' -allowUpdates' }
           $opts = $opts.Trim()
