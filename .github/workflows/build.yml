@@ -1,7 +1,7 @@
 name: Build Windows
 
 run-name: >
-  ${{ fromJSON('{"Windows 10 22H2":"W10","Windows 11 23H2":"W11","Windows 11 24H2":"W11","Windows 11 24H2 BETA":"W11B","Windows 11 25H2":"W11","Windows BETA":"W11B","Windows 11 26H1":"W11","Windows 11 26H2":"W11","Windows DEV":"W11D","Windows CANARY":"W11C"}')[inputs.versions] }}
+  ${{ fromJSON('{"Windows 10 22H2":"W10","Windows 11 23H2":"W11","Windows 11 24H2":"W11","Windows 11 24H2 BETA":"W11B","Windows 11 Custom":"W11C","Windows 11 25H2":"W11","Windows BETA":"W11B","Windows 11 26H1":"W11","Windows 11 26H2":"W11","Windows DEV":"W11D","Windows CANARY":"W11C"}')[inputs.versions] }}
   ${{ fromJSON('{"Pro":"PRO","Home":"HOME","Multi":"MULTI"}')[inputs.edition] }}
   ${{ fromJSON('{"x64":"X64","arm64":"ARM64"}')[inputs.architecture] }}
   ${{ fromJSON('{
@@ -34,6 +34,7 @@ on:
           - Windows 11 23H2
           - Windows 11 24H2
           - Windows 11 24H2 BETA
+          - Windows 11 Custom
           - Windows 11 25H2
           - Windows 11 26H1
           - Windows 11 26H2
@@ -93,7 +94,7 @@ on:
         default: Chinese (Simplified, China)
         required: true
       revision:
-        description: "Revision number (optional)"
+        description: "Revision number (required for Windows 11 Custom)"
         type: string
         required: false
       esd:
@@ -202,6 +203,7 @@ jobs:
             'Windows 11 23H2'      = 'windows-11old'
             'Windows 11 24H2'      = 'windows-11'
             'Windows 11 24H2 BETA' = 'windows-11beta'
+            'Windows 11 Custom'     = 'windows-custom'
             'Windows 11 25H2'      = 'windows-11new'
             'Windows BETA'         = 'windows-11beta'
             'Windows 11 26H1'      = 'windows-1126h1'
@@ -217,12 +219,17 @@ jobs:
           if ('${{ inputs.esd }}' -eq 'true') { $opts += ' -esd' }
           if (('${{ inputs.drivers }}' -eq 'true') -and ('${{ inputs.architecture }}' -ne 'arm64')) { $opts += ' -drivers' }
           if ('${{ inputs.netfx3 }}' -eq 'true') { $opts += ' -netfx3' }
-          if (-not [string]::IsNullOrWhiteSpace('${{ inputs.revision }}')) {
-            if ('${{ inputs.revision }}' -notmatch '^[0-9]+(\.[0-9]+)*$') {
-              throw "Invalid revision '${{ inputs.revision }}': only digits and dots are allowed."
-            }
-            $opts += ' -revision "${{ inputs.revision }}"'
+          $revision = '${{ inputs.revision }}'
+          if ($verCode -eq 'windows-custom' -and [string]::IsNullOrWhiteSpace($revision)) {
+            throw 'Windows 11 Custom requires Revision number.'
           }
+          if (-not [string]::IsNullOrWhiteSpace($revision)) {
+            if ($revision -notmatch '^[0-9]+(\.[0-9]+)*$') {
+              throw "Invalid revision '$revision': only digits and dots are allowed."
+            }
+            $opts += ' -revision "$revision"'
+          }
+          if ($verCode -eq 'windows-custom') { $opts += ' -allowUpdates' }
           $opts = $opts.Trim()
 
           echo "lang=$langCode" >> $env:GITHUB_OUTPUT
@@ -601,7 +608,8 @@ jobs:
             $descMap = @{
               '-esd'     = 'Use ESD compression'
               '-drivers' = 'Add additional drivers'
-              '-netfx3'  = 'Add .NET Framework 3.5'
+              '-netfx3'       = 'Add .NET Framework 3.5'
+              '-allowupdates' = 'Allow Windows update UUP packages'
             }
             $tokens = @($opts -split '\s+' | Where-Object { $_ -and $_.Trim() -ne '' })
             $items = @()
