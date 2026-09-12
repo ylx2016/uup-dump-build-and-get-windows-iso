@@ -240,7 +240,7 @@ jobs:
         id: build_windows
         shell: pwsh
         run: |
-          if (${{ steps.map.outputs.version }} -eq 'windows-custom') {
+          if ('${{ steps.map.outputs.version }}' -eq 'windows-custom') {
             $customTarget = Select-String -LiteralPath 'uup-dump-get-windows-iso.ps1' -Pattern '"windows-custom"' -Quiet
             if (-not $customTarget) {
               throw 'Checked-out uup-dump-get-windows-iso.ps1 does not contain the windows-custom target. Commit this repository version of the script together with build.yml.'
