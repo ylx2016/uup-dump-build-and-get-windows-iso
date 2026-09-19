@@ -157,24 +157,35 @@ function Invoke-UupDumpApi([string]$name, [hashtable]$body) {
   throw "timeout making the uup-dump api $name request"
 }
 
+function Resolve-UupDumpBuilds($builds) {
+  # The UUP dump api returns builds as an object keyed by index when its internal
+  # keys are non-sequential, and as an array when they are. Normalize both shapes
+  # (plus the single object Invoke-RestMethod yields for a one-element array) into
+  # a plain list of build entries.
+  if ($null -eq $builds) { return @() }
+  if ($builds -isnot [System.Management.Automation.PSCustomObject]) { return @($builds) }
+  if ($builds.PSObject.Properties.Name -contains 'uuid') { return @($builds) }
+  return @($builds.PSObject.Properties | ForEach-Object { $_.Value })
+}
+
 function Get-UupDumpIso($name, $target) {
   Write-CleanLine "Getting the $name metadata"
   $result = Invoke-UupDumpApi listid @{ search = $target.search }
 
-  $result.response.builds.PSObject.Properties
+  Resolve-UupDumpBuilds $result.response.builds
   | ForEach-Object {
-      $id = $_.Value.uuid
+      $id = $_.uuid
       $uupDumpUrl = 'https://uupdump.net/selectlang.php?' + (New-QueryString @{ id = $id })
       Write-CleanLine "Processing $name $id ($uupDumpUrl)"
       $_
     }
   | Where-Object {
-      if ($_.Value.title -match '\.NET Framework') {
+      if ($_.title -match '\.NET Framework') {
             Write-CleanLine "Skipping, ignore .NET Framework update."
             return $false
         }
       if (!$allowUpdates -and !$preview) {
-        $ok = ($target.search -like '*preview*') -or ($_.Value.title -notlike '*preview*')
+        $ok = ($target.search -like '*preview*') -or ($_.title -notlike '*preview*')
         if (-not $ok) {
           Write-CleanLine "Skipping.
 L1: Expected preview=false.
@@ -185,15 +196,15 @@ L2: Got preview=true."
       $true
     }
   | ForEach-Object {
-      $id = $_.Value.uuid
+      $id = $_.uuid
       Write-CleanLine "Getting the $name $id langs metadata"
       $result = Invoke-UupDumpApi listlangs @{ id = $id }
-      if ($result.response.updateInfo.build -ne $_.Value.build) {
+      if ($result.response.updateInfo.build -ne $_.build) {
         throw 'for some reason listlangs returned an unexpected build'
       }
-      $_.Value | Add-Member -NotePropertyMembers @{ langs = $result.response.langFancyNames; info = $result.response.updateInfo }
+      $_ | Add-Member -NotePropertyMembers @{ langs = $result.response.langFancyNames; info = $result.response.updateInfo }
 
-      $langs = $_.Value.langs.PSObject.Properties.Name
+      $langs = $_.langs.PSObject.Properties.Name
       $eds = if ($langs -contains $lang) {
         Write-CleanLine "Getting the $name $id editions metadata"
         $result = Invoke-UupDumpApi listeditions @{ id = $id; lang = $lang }
@@ -204,17 +215,17 @@ L3: Expected langs=$lang.
 L4: Got langs=$($langs -join ',')."
         [PSCustomObject]@{}
       }
-      $_.Value | Add-Member -NotePropertyMembers @{ editions = $eds }
+      $_ | Add-Member -NotePropertyMembers @{ editions = $eds }
       $_
     }
   | Where-Object {
-      $langs = $_.Value.langs.PSObject.Properties.Name
-      $editions = $_.Value.editions.PSObject.Properties.Name
+      $langs = $_.langs.PSObject.Properties.Name
+      $editions = $_.editions.PSObject.Properties.Name
       $res = $true
 
       $expectedRing = if ($ringLower) { $ringLower.ToUpper() } else { 'RETAIL' }
       if ($ringLower) {
-        $actual = ($_.Value.info.ring).ToUpper()
+        $actual = ($_.info.ring).ToUpper()
         if ($ringLower -in @('dev','beta')) {
           if ($actual -notin @($expectedRing, 'WIF', 'WIS')) {
             Write-CleanLine "Skipping.
@@ -246,7 +257,7 @@ L7: Got editions={1}." -f (Get-EditionName $edition), ($editions -join ','))
         $res = $false
       }
 
-      if (!$allowUpdates -and !$preview -and -not ($_.Value.title -match 'version')) {
+      if (!$allowUpdates -and !$preview -and -not ($_.title -match 'version')) {
         Write-CleanLine "Skipping. Unexpected title format: missing 'version'."
         $res = $false
       }
@@ -255,11 +266,11 @@ L7: Got editions={1}." -f (Get-EditionName $edition), ($editions -join ','))
     }
   | Select-Object -First 1
   | ForEach-Object {
-      $id = $_.Value.uuid
+      $id = $_.uuid
       [PSCustomObject]@{
         name               = $name
-        title              = $_.Value.title
-        build              = $_.Value.build
+        title              = $_.title
+        build              = $_.build
         id                 = $id
         edition            = $target.edition
         virtualEdition     = $target['virtualEdition']
@@ -462,3 +473,4 @@ function Get-WindowsIso($name, $destinationDirectory) {
 }
 
 Get-WindowsIso $windowsTargetName $destinationDirectory
+
