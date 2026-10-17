@@ -213,7 +213,7 @@ L2: Got preview=true."
         Write-CleanLine "Skipping.
 L3: Expected langs=$lang.
 L4: Got langs=$($langs -join ',')."
-        [PSCustomObject]@{}
+        $null
       }
       $_ | Add-Member -NotePropertyMembers @{ editions = $eds }
       $_
@@ -441,6 +441,13 @@ function Get-WindowsIso($name, $destinationDirectory) {
 
   $sourceIsoPath = Resolve-Path $buildDirectory/*.iso
   $IsoName = Split-Path $sourceIsoPath -leaf
+
+  # The UUP converter discards a package it cannot apply and still exits 0, so the
+  # produced ISO can silently be an older build than the one requested. Verify the
+  # ISO name starts with the requested build before publishing anything.
+  if (-not $IsoName.StartsWith("$($iso.build).", [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Unexpected ISO name '$IsoName': expected the requested build '$($iso.build)'. The UUP converter likely discarded an update."
+  }
 
   Write-CleanLine "Getting the $sourceIsoPath checksum"
   $isoChecksum = (Get-FileHash -Algorithm SHA256 $sourceIsoPath).Hash.ToLowerInvariant()
